@@ -1,0 +1,16 @@
+services:
+  okx-event-bot:
+    build: .
+    container_name: okx-event-bot
+    restart: unless-stopped
+    env_file: .env          # cp .env.example .env first — required even for mock_mode (values can stay empty)
+    environment:
+      - DASHBOARD_WEB_HOST=0.0.0.0   # 127.0.0.1 (config.yaml default) would be unreachable from outside the container
+    ports:
+      - "8000:8000"
+    volumes:
+      # Mounted, not baked into the image, so you can flip mock_mode / add
+      # seriesId / tune strategies without rebuilding.
+      - ./config.yaml:/app/config.yaml:ro
+      # Persists bot.db (SQLite) and bot.log across restarts/rebuilds.
+      - ./data:/app/data
