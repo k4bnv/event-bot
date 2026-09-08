@@ -1,0 +1,193 @@
+# =============================================================================
+# OKX Event-Contract Paper-Trading Bot — main configuration
+# =============================================================================
+
+# --- Data source -------------------------------------------------------------
+# true  -> fully offline synthetic BTC price generator + synthetic event
+#          contracts. Zero API keys needed. Use this to validate strategy
+#          logic, the wallet/metrics/dashboard pipeline end-to-end.
+# false -> pulls real BTC/USDT market data from OKX (public, unauthenticated,
+#          rock-solid v5 endpoints) and real Event-Contract quotes from OKX
+#          Demo Trading (instType=EVENTS). See README "Event Contracts caveat".
+mock_mode: true
+
+okx:
+  underlying_inst_id: "BTC-USDT"        # standard spot pair used for strategy signals
+  # seriesId values identifying the rolling BTC "price direction" (UP/DOWN)
+  # event-contract markets, e.g. "BTC-UPDOWN-15MIN". Confirmed format against
+  # OKX's own open-source reference client (github.com/okx/agent-trade-kit),
+  # but exact frequencies offered (5min/15min/1H/...) can change — run
+  # `python run.py --discover-series` (needs API keys, see README) to print
+  # what's currently live on your account and paste the exact values here.
+  series_ids:
+    - "BTC-UPDOWN-5MIN"
+    - "BTC-UPDOWN-15MIN"
+  poll_interval_sec: 3
+  request_timeout_sec: 10
+  max_retries: 5
+  retry_backoff_base_sec: 1.5
+  # After a contract's expiry we poll a few more times waiting for OKX to
+  # settle it (price snaps to 0 or 1) before giving up.
+  settlement_poll_attempts: 10
+  settlement_poll_interval_sec: 2
+  # BTC perpetual swap used by the funding_skew strategy. Funding only
+  # settles every 8h, so we don't re-fetch it every poll tick.
+  funding_inst_id: "BTC-USDT-SWAP"
+  funding_refresh_interval_sec: 300
+
+# --- Strategies ----------------------------------------------------------------
+# Every strategy has its OWN independent virtual deposit (deposit_usd) — NOT
+# a slice of one shared pool. Default $100 each, override per-strategy below;
+# also changeable live from the web dashboard's "Депозит по стратегиям" panel
+# (applying there always resets, same as the Reset DB button — see README).
+strategies:
+  breakout_retest:
+    enabled: true
+    display_name: "A: Breakout & Retest"
+    deposit_usd: 100
+    entry_windows_min: [12, 7, 2]     # minutes-to-expiry entry checkpoints
+    max_coefficient: 0.55             # never buy a contract priced above this
+    stake_fraction: 0.08              # fraction of strategy wallet per trade
+    impulse_lookback_sec: 90
+    impulse_threshold_pct: 0.12       # % move that counts as an "impulse"
+    retest_tolerance_pct: 0.05        # how close price must return to the level
+
+  orderbook_momentum:
+    enabled: true
+    display_name: "B: Momentum / Orderbook"
+    deposit_usd: 100
+    entry_windows_min: [12, 7, 2]
+    max_coefficient: 0.55
+    stake_fraction: 0.08
+    orderbook_depth_levels: 10
+    imbalance_threshold: 1.8          # bid-volume / ask-volume ratio to trigger
+
+  mean_reversion:
+    enabled: true
+    display_name: "C: Mean Reversion"
+    deposit_usd: 100
+    entry_windows_min: [7, 2]
+    max_coefficient: 0.5
+    stake_fraction: 0.08
+    lookback_sec: 180
+    extreme_zscore: 1.5               # |z| above this = "local extreme"
+
+  volatility_breakout:
+    enabled: true
+    display_name: "D: Volatility-Adaptive Breakout"
+    deposit_usd: 100
+    entry_windows_min: [12, 7, 2]
+    max_coefficient: 0.55
+    stake_fraction: 0.08
+    breakout_lookback_sec: 60           # window checked for the impulse+retest itself
+    vol_lookback_sec: 300               # baseline window BEFORE that, used only to size the threshold
+    vol_multiplier: 2.5                 # threshold = vol_multiplier * baseline realized_vol_pct
+    min_threshold_pct: 0.03             # floor, so near-zero volatility doesn't trigger on noise
+    retest_tolerance_mult: 0.4          # tolerance = threshold_pct * this
+
+  fair_value_edge:
+    enabled: true
+    display_name: "E: Fair-Value / Probability Edge"
+    deposit_usd: 100
+    entry_windows_min: [12, 7, 2]
+    max_coefficient: 0.7               # this strategy trades edge, not cheapness — allow pricier contracts
+    stake_fraction: 0.08
+    lookback_sec: 120
+    min_edge: 0.08                     # min |model_prob - market_px| to trade (0.08 = 8 percentage points)
+
+  funding_skew:
+    enabled: true
+    display_name: "F: Funding Rate Skew"
+    deposit_usd: 100
+    entry_windows_min: [12, 7, 2]
+    max_coefficient: 0.55
+    stake_fraction: 0.08
+    funding_rate_threshold: 0.0003     # fraction; 0.0003 = 0.03% per funding interval
+
+  # Opt-in: costs money per call and needs an API key (see .env.example).
+  # Left disabled so cloning this repo never silently burns API credits.
+  # Cost knobs tuned for a small prepaid balance (e.g. a few dollars):
+  # entry_windows_min (1 checkpoint) x min_seconds_between_calls x
+  # max_calls_per_day together cap this at <=100 calls/day; with
+  # gemini-3.1-flash-lite's ~$0.25/M in + $1.50/M out and this prompt's size
+  # (~120 input + <=80 output tokens/call), that's well under $0.01/day —
+  # a $3 balance covers many months at these settings. Loosen
+  # entry_windows_min/min_seconds_between_calls/max_calls_per_day once
+  # you've watched a day of data/bot.log and are comfortable with the spend.
+  ai_prompt:
+    enabled: false
+    display_name: "G: AI Prompt"
+    deposit_usd: 100
+    entry_windows_min: [2]             # one checkpoint (closest to expiry) -> fewest paid calls
+    max_coefficient: 0.6
+    stake_fraction: 0.08
+    # provider: requesty (router.requesty.ai, one key -> 600+ models, "provider/model"
+    #           naming — https://docs.requesty.ai/features/supported-models) | deepseek
+    #           (talks to DeepSeek directly, no router) | openai_compatible (any other
+    #           OpenAI-shaped gateway via OPENAI_COMPATIBLE_{API_KEY,BASE_URL,MODEL}).
+    provider: "requesty"
+    # Fast + cheap + reliable JSON is what matters here — NOT a "reasoning" model
+    # (avoid deepseek-reasoner / o3 / extended-thinking Claude/Gemini: seconds of
+    # extra latency and cost for no benefit at this task's depth). Avoid ":flex"
+    # variants too (lower priority = higher latency) — bad fit when the decision
+    # must land before the contract's expiry. Good options via Requesty:
+    # "google/gemini-3.1-flash-lite" (cheapest/fastest, default below),
+    # "anthropic/claude-haiku-4-5-20251001" (pricier, best text/news interpretation),
+    # "deepseek/deepseek-chat" (also cheap, usually slower than the other two).
+    model: "google/gemini-3.1-flash-lite"
+    lookback_sec: 180
+    price_sample_count: 8              # fewer price samples in the prompt = fewer input tokens
+    min_seconds_between_calls: 300      # cooldown across ALL checkpoints/series, not just one
+    max_calls_per_day: 100              # hard ceiling regardless of cooldown math above — the real safety net
+    max_tokens: 80                      # response is one short JSON object; no need for more
+    temperature: 0.2
+    timeout_sec: 20
+    # Free-text context handed to the model verbatim — this is the whole
+    # point of this strategy (news/narrative the numeric strategies can't
+    # see). Wire a real news feed in here if you want it to do anything;
+    # left empty it's just a numeric strategy with extra latency/cost.
+    news_context: ""
+    # Trade only if the model's prob_up is at least this far from a
+    # coin-flip (0.5) — same idea as fair_value_edge's own min_edge, just
+    # applied to the LLM's adjusted probability. Only used by the barrier
+    # ({"prob_up": ...}) response schema below, not the default UP/DOWN one.
+    min_edge: 0.05
+    # Full prompt template — editable here or live from the dashboard's
+    # Settings tab (renders as a textarea). Uses $name / ${name} placeholders
+    # (Python string.Template, NOT {name}) — deliberately, since a prompt
+    # that asks for JSON back contains literal {...}, which str.format
+    # would misparse; a typo'd or removed $placeholder is just left as
+    # literal text instead of crashing this strategy. All placeholders
+    # (incl. $z_score/$base_prob/$sigma_horizon/$drift_5m/$mom_1m used
+    # below) are documented in src/strategies/ai_prompt.py's module
+    # docstring. This is the barrier-estimate template (statistical
+    # z-score/CDF as an anchor, LLM applies a small bounded correction from
+    # drift/momentum) — swap for DEFAULT_PROMPT_TEMPLATE's plain wording
+    # (also in ai_prompt.py) if you'd rather have a direct UP/DOWN/NONE call.
+    prompt_template: |-
+      $symbol, барьер $target, спот $spot, осталось $seconds_left сек.
+
+      Предрасчитано в коде:
+        z-score: $z_score
+        нормальная CDF(z): $base_prob
+        sigma на оставшийся горизонт: ${sigma_horizon}%
+      Дрейф 5 мин: ${drift_5m}% | Импульс 1 мин: ${mom_1m}%
+
+      BASE_PROB — чисто статистическая оценка без учёта направления рынка.
+      Скорректируй её на дрейф и импульс. Коррекция не более ±0.10.
+      Если дрейф и импульс разнонаправлены — коррекция близка к нулю.
+
+      {"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,
+      "reason":"<макс 10 слов>"}
+
+# --- Dashboard -----------------------------------------------------------------
+dashboard:
+  mode: web                 # console | web | both | none
+  refresh_sec: 2
+  web_host: "127.0.0.1"
+  web_port: 8000
+
+# --- Persistence -----------------------------------------------------------------
+storage:
+  data_dir: "data"
+  snapshot_every_sec: 15
