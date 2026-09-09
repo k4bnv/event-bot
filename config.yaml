@@ -47,7 +47,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]     # minutes-to-expiry entry checkpoints
     max_coefficient: 0.55             # never buy a contract priced above this
-    stake_fraction: 0.08              # fraction of strategy wallet per trade
+    stake_fraction: 0.01              # fraction of strategy wallet per trade
     impulse_lookback_sec: 90
     impulse_threshold_pct: 0.12       # % move that counts as an "impulse"
     retest_tolerance_pct: 0.05        # how close price must return to the level
@@ -58,7 +58,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
     max_coefficient: 0.55
-    stake_fraction: 0.08
+    stake_fraction: 0.01
     orderbook_depth_levels: 10
     imbalance_threshold: 1.8          # bid-volume / ask-volume ratio to trigger
 
@@ -68,7 +68,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [7, 2]
     max_coefficient: 0.5
-    stake_fraction: 0.08
+    stake_fraction: 0.01
     lookback_sec: 180
     extreme_zscore: 1.5               # |z| above this = "local extreme"
 
@@ -78,7 +78,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
     max_coefficient: 0.55
-    stake_fraction: 0.08
+    stake_fraction: 0.01
     breakout_lookback_sec: 60           # window checked for the impulse+retest itself
     vol_lookback_sec: 300               # baseline window BEFORE that, used only to size the threshold
     vol_multiplier: 2.5                 # threshold = vol_multiplier * baseline realized_vol_pct
@@ -91,7 +91,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
     max_coefficient: 0.7               # this strategy trades edge, not cheapness — allow pricier contracts
-    stake_fraction: 0.08
+    stake_fraction: 0.01
     lookback_sec: 120
     min_edge: 0.08                     # min |model_prob - market_px| to trade (0.08 = 8 percentage points)
 
@@ -101,7 +101,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
     max_coefficient: 0.55
-    stake_fraction: 0.08
+    stake_fraction: 0.01
     funding_rate_threshold: 0.0003     # fraction; 0.0003 = 0.03% per funding interval
 
   # Opt-in: costs money per call and needs an API key (see .env.example).
@@ -120,7 +120,7 @@ strategies:
     deposit_usd: 100
     entry_windows_min: [2]             # one checkpoint (closest to expiry) -> fewest paid calls
     max_coefficient: 0.6
-    stake_fraction: 0.08
+    stake_fraction: 0.01
     # provider: requesty (router.requesty.ai, one key -> 600+ models, "provider/model"
     #           naming — https://docs.requesty.ai/features/supported-models) | deepseek
     #           (talks to DeepSeek directly, no router) | openai_compatible (any other

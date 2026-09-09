@@ -7,7 +7,12 @@ services:
     environment:
       - DASHBOARD_WEB_HOST=0.0.0.0   # 127.0.0.1 (config.yaml default) would be unreachable from outside the container
     ports:
-      - "8000:8000"
+      # Host:container — host side is 8006 (8000 was already taken by
+      # something else on the server; the app inside the container still
+      # listens on 8000, nothing internal changes). If you put this behind
+      # a reverse proxy (Caddy/nginx) for the domain, update its upstream
+      # port to 8006 too, or the domain will stop resolving to this container.
+      - "8006:8000"
     volumes:
       # Mounted, not baked into the image, so you can flip mock_mode / add
       # seriesId / tune strategies without rebuilding.
