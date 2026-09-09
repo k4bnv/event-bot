@@ -909,12 +909,18 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
         # snap.wallets is keyed by Engine's composite "strategy:window_min"
         # wallet id (one wallet per entry checkpoint now, not per
         # strategy) — the base strategy name/display_name lookup has to
-        # come from w.strategy, not the dict key itself.
+        # come from w.strategy, not the dict key itself. w.window_min is
+        # None for a dynamic_timing strategy's one shared wallet (see
+        # StrategyConfig.dynamic_timing) — labeled "(авто)" rather than
+        # "(Noneм)".
         wallets = [
             {
                 "strategy": w.strategy,
                 "window_min": w.window_min,
-                "display_name": f"{display_names.get(w.strategy, w.strategy)} ({w.window_min}м)",
+                "display_name": (
+                    f"{display_names.get(w.strategy, w.strategy)} "
+                    + (f"({w.window_min}м)" if w.window_min is not None else "(авто)")
+                ),
                 "initial_balance": w.initial_balance,
                 "balance": w.balance,
                 "reserved": w.reserved,

@@ -46,6 +46,16 @@ class StrategyConfig:
     entry_windows_min: list[int]
     max_coefficient: float
     stake_fraction: float
+    # False (default): each entry_windows_min checkpoint gets its own
+    # independent wallet (see Engine._wallet_key) — the normal case, every
+    # checkpoint is its own bet. True: this strategy places AT MOST ONE
+    # trade per market despite scanning many checkpoints (see
+    # adaptive_timing), so it gets exactly ONE shared wallet instead of
+    # one per configured checkpoint — one small bettor, not N idle ones
+    # that (almost) never fire. Not exposed in the Settings tab: flipping
+    # it changes wallet STRUCTURE (how many wallets exist at all), not
+    # just a numeric knob, so it's config.yaml + redeploy only for now.
+    dynamic_timing: bool = False
     # Reject a signal if the honest book-simulated fill price (see
     # EventMarket.fill_price_for) is more than this many PERCENT worse
     # than the naive quoted price (up_price/1-up_price) — the paper-
@@ -93,6 +103,7 @@ _KNOWN_STRATEGY_FIELDS = {
     "max_coefficient",
     "stake_fraction",
     "max_slippage_pct",
+    "dynamic_timing",
 }
 
 DEFAULT_DEPOSIT_USD = 100.0
@@ -141,6 +152,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 max_slippage_pct=(
                     float(s_raw["max_slippage_pct"]) if s_raw.get("max_slippage_pct") is not None else None
                 ),
+                dynamic_timing=bool(s_raw.get("dynamic_timing", False)),
                 extra=extra,
             )
         )

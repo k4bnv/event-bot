@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import AppConfig, DashboardConfig, OkxConfig, StorageConfig, StrategyConfig
 from src.engine import Engine
 from src.mock_market import MockMarketDataProvider
-from src.models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, Trade, TradeStatus
+from src.models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, PricePoint, Trade, TradeStatus
 from src.storage import Storage
 from src.strategies.base import Signal
 
@@ -35,6 +35,24 @@ def make_config(data_dir: Path) -> AppConfig:
     dashboard = DashboardConfig(mode="none", refresh_sec=2, web_host="127.0.0.1", web_port=8000)
     storage_cfg = StorageConfig(data_dir=data_dir, snapshot_every_sec=15)
     return AppConfig(mock_mode=True, okx=okx, strategies=strategies, dashboard=dashboard, storage=storage_cfg)
+
+
+def make_config_with_adaptive_timing(data_dir: Path) -> AppConfig:
+    """A separate builder (not make_config()) so these dynamic_timing-
+    specific tests don't change the strategy count/enabled-set every
+    OTHER engine test already assumes (e.g. the "at least one strategy
+    must stay enabled" validation test disables both of make_config()'s
+    two strategies expecting that to be rejected — a third, always-
+    enabled strategy would silently satisfy that check instead)."""
+    cfg = make_config(data_dir)
+    cfg.strategies.append(
+        StrategyConfig(
+            name="adaptive_timing", display_name="J", enabled=True, deposit_usd=100.0,
+            entry_windows_min=[5, 4, 3], max_coefficient=0.7, stake_fraction=0.08,
+            dynamic_timing=True, extra={},
+        )
+    )
+    return cfg
 
 
 class EngineResetStrategyTests(unittest.TestCase):
@@ -185,6 +203,67 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
             engine.storage.close()
 
 
+class DynamicTimingWalletTests(unittest.TestCase):
+    """A dynamic_timing strategy (see StrategyConfig.dynamic_timing,
+    adaptive_timing.py) is the deliberate exception to "one wallet per
+    checkpoint": it places at most one trade per market no matter how
+    many of its (densely-spaced) checkpoints actually fire, so splitting
+    its capital N ways the way every other strategy's IS split would
+    just leave N-1 wallets permanently idle. It gets exactly ONE wallet,
+    keyed by the bare strategy name (no ":window_min" suffix)."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config_with_adaptive_timing(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    def _dynamic_wallet_keys(self, engine: Engine) -> list[str]:
+        return [k for k in engine.wallets if k == "adaptive_timing" or k.startswith("adaptive_timing:")]
+
+    def test_gets_exactly_one_wallet_not_one_per_checkpoint(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            # Three checkpoints configured (see make_config_with_adaptive_timing)
+            # -> still exactly ONE wallet, keyed by the bare strategy name.
+            self.assertEqual(self._dynamic_wallet_keys(engine), ["adaptive_timing"])
+            wallet = engine.wallet_for("adaptive_timing")
+            self.assertIsNone(wallet.window_min)
+            self.assertEqual(wallet.strategy, "adaptive_timing")
+            self.assertEqual(wallet.balance, 100.0)  # full deposit, same as any other strategy
+            engine.storage.close()
+
+    def test_reset_strategy_rebuilds_the_single_shared_wallet(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            old_wallet = engine.wallet_for("adaptive_timing")
+            old_wallet.balance = 55.0
+
+            engine.reset_strategy("adaptive_timing")
+
+            self.assertEqual(self._dynamic_wallet_keys(engine), ["adaptive_timing"])  # still just one
+            new_wallet = engine.wallet_for("adaptive_timing")
+            self.assertEqual(new_wallet.balance, 100.0)
+            self.assertIsNot(new_wallet, old_wallet)
+            engine.storage.close()
+
+    def test_balance_is_restored_from_storage_across_a_restart(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine1 = self._make_engine(tmp_path)
+            engine1.wallet_for("adaptive_timing").balance = 123.0
+            engine1.storage.write_snapshot(engine1.wallets)
+            engine1.storage.close()
+
+            storage2 = Storage(tmp_path)
+            cfg2 = make_config_with_adaptive_timing(tmp_path)
+            provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
+            engine2 = Engine(cfg2, provider2, storage2)
+
+            self.assertEqual(engine2.wallet_for("adaptive_timing").balance, 123.0)
+            engine2.storage.close()
+
+
 class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
     """Confirms the actual wiring in _open_due_trades — not just
     EventMarket.fill_price_for in isolation — uses the honest,
@@ -302,6 +381,56 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
             await engine._open_due_trades()
 
             self.assertEqual(len(engine.wallet_for("breakout_retest", 2).trades), 1)
+            engine.storage.close()
+
+
+class AdaptiveTimingOneShotPerMarketTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end: a dynamic_timing strategy scanning a dense checkpoint
+    grid must place AT MOST ONE trade per market, even when several of
+    its checkpoints are due in the very same _open_due_trades() call
+    (the exact case a strategy that only self-gates on TIME, not on its
+    own open trades, would double-bet on)."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config_with_adaptive_timing(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    async def test_only_one_trade_opens_when_two_checkpoints_are_due_at_once(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+
+            # up_price=0.10 is far below what the (flat, floored-vol)
+            # model would say for a market sitting right at its strike —
+            # a clear, persistent edge so BOTH due checkpoints below would
+            # signal if nothing stopped the second one.
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST-ADAPTIVE",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.10, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            now = time.time()
+            engine.provider._price_history.clear()
+            for i in range(20):
+                px = 50000.0 + (5 if i % 2 == 0 else -5)
+                engine.provider._price_history.append(PricePoint(ts=now - (20 - i), price=px))
+
+            # Prime the window at remaining=5min so BOTH "4" and "3" (out
+            # of adaptive_timing's configured [5, 4, 3]) end up due
+            # together once remaining drops to ~1min (see EventMarket
+            # above: expiry_ts is 60s out).
+            _prime_entry_window(engine, series_id, expiry_ts, "adaptive_timing")
+
+            for other_name in ("breakout_retest", "mean_reversion"):
+                engine.strategy_instances[other_name].evaluate = lambda ctx: _async_result(None)
+
+            await engine._open_due_trades()
+
+            wallet = engine.wallet_for("adaptive_timing")
+            self.assertEqual(len(wallet.trades), 1)  # not 2, despite 2 checkpoints firing at once
             engine.storage.close()
 
 

@@ -41,6 +41,17 @@ class StrategyContext:
     # strategy actually held a position in it. None if not known yet
     # (engine just started) or a lookup gave up after retrying.
     previous_outcome: Optional[Direction] = None
+    # True when this strategy already has an OPEN trade in this EXACT
+    # market (same series_id + expiry_ts). Most strategies fire at a few
+    # fixed checkpoints and are fine stacking a separate bet at each one —
+    # this only matters to a strategy meant to place AT MOST ONE trade per
+    # market despite being called at many checkpoints (see
+    # adaptive_timing, which scans a dense grid and enters at whichever
+    # one first looks good); such a strategy checks this and returns None
+    # once it's already positioned, so it naturally retries at the next
+    # checkpoint if an earlier signal got rejected (no live quote, low
+    # balance, ...) rather than giving up on the market for good.
+    already_open_this_market: bool = False
 
 
 class BaseStrategy(ABC):

@@ -279,6 +279,30 @@ strategies:
     max_coefficient: 0.85
     stake_fraction: 0.01
 
+  # Same edge math as fair_value_edge (E) — driftless log-normal fair
+  # probability vs OKX's own quoted price — but instead of a few fixed
+  # checkpoints, it's scanned at a dense grid and enters at the FIRST
+  # moment (per market) the edge clears min_edge, wherever in the
+  # market's life that happens to be. dynamic_timing: true is required
+  # here — it collapses all these checkpoints onto ONE shared wallet
+  # instead of splitting capital across a dozen of them (see
+  # src/strategies/adaptive_timing.py's module docstring). Over many
+  # trades, the "Стратегия × время входа" table's entry_window_min column
+  # becomes a live, empirical answer to "which minute-to-expiry is
+  # actually best for this edge" — compare its actual chosen windows
+  # against E's fixed 12/7/2 to see whether picking the moment beats
+  # guessing it.
+  adaptive_timing:
+    enabled: true
+    display_name: "J: Adaptive Timing"
+    deposit_usd: 100
+    dynamic_timing: true
+    entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+    max_coefficient: 0.7
+    stake_fraction: 0.01
+    lookback_sec: 120
+    min_edge: 0.08
+
 # --- Dashboard -----------------------------------------------------------------
 dashboard:
   mode: web                 # console | web | both | none

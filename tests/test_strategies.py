@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.llm_client import ChatAPIError
 from src.models import Direction, EventMarket, PricePoint
+from src.strategies.adaptive_timing import AdaptiveTimingStrategy
 from src.strategies.ai_prompt import (
     BARRIER_PROMPT_TEMPLATE, AIPromptStrategy, build_client_config, _guess_symbol, _pct_change_over,
 )
@@ -38,12 +39,12 @@ def make_market(
 
 def make_ctx(
     price_history, orderbook=None, remaining_sec=200.0, window_min=7, market=None, funding_rate=None,
-    previous_outcome=None,
+    previous_outcome=None, already_open_this_market=False,
 ):
     return StrategyContext(
         price_history=price_history, orderbook=orderbook, remaining_sec=remaining_sec,
         window_min=window_min, market=market or make_market(), funding_rate=funding_rate,
-        previous_outcome=previous_outcome,
+        previous_outcome=previous_outcome, already_open_this_market=already_open_this_market,
     )
 
 
@@ -158,6 +159,55 @@ class FairValueEdgeStrategyTests(unittest.IsolatedAsyncioTestCase):
         strategy = FairValueEdgeStrategy(config={})
         self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=None, floor_strike=100.0))))
         self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=0.5, floor_strike=None))))
+
+
+class AdaptiveTimingStrategyTests(unittest.IsolatedAsyncioTestCase):
+    """Same edge math as FairValueEdgeStrategy (deliberately — see the
+    module docstring), so the interesting behavior to test here is the
+    scanning/one-shot-per-market part, not the edge calculation itself
+    (already covered by FairValueEdgeMathTests/FairValueEdgeStrategyTests)."""
+
+    async def test_signals_up_when_model_prob_beats_market_price(self):
+        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
+        points = make_points(noisy)
+        market = make_market(up_price=0.20, floor_strike=100.0)
+        ctx = make_ctx(points, remaining_sec=120, market=market)
+        strategy = AdaptiveTimingStrategy(config={"min_edge": 0.08})
+        signal = await strategy.evaluate(ctx)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+
+    async def test_no_signal_when_market_price_matches_model(self):
+        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
+        points = make_points(noisy)
+        market = make_market(up_price=0.5, floor_strike=100.0)
+        ctx = make_ctx(points, remaining_sec=120, market=market)
+        strategy = AdaptiveTimingStrategy(config={"min_edge": 0.08})
+        self.assertIsNone(await strategy.evaluate(ctx))
+
+    async def test_no_signal_without_market_quote_or_strike(self):
+        points = make_points([100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)])
+        strategy = AdaptiveTimingStrategy(config={})
+        self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=None, floor_strike=100.0))))
+        self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=0.5, floor_strike=None))))
+
+    async def test_already_open_this_market_suppresses_a_signal_it_would_otherwise_take(self):
+        """The whole point of the scan: once it's placed one trade in a
+        market, it must sit out every later checkpoint of that SAME
+        market even if the edge still (or again) looks good — otherwise
+        a strategy meant to enter at most once per market would stack
+        bets exactly like the fixed-checkpoint strategies do on purpose."""
+        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
+        points = make_points(noisy)
+        market = make_market(up_price=0.20, floor_strike=100.0)
+        strategy = AdaptiveTimingStrategy(config={"min_edge": 0.08})
+
+        # Without the flag, this exact same setup DOES signal (sanity check).
+        ctx_free = make_ctx(points, remaining_sec=120, market=market, already_open_this_market=False)
+        self.assertIsNotNone(await strategy.evaluate(ctx_free))
+
+        ctx_committed = make_ctx(points, remaining_sec=90, market=market, already_open_this_market=True)
+        self.assertIsNone(await strategy.evaluate(ctx_committed))
 
 
 class VolatilityBreakoutStrategyTests(unittest.IsolatedAsyncioTestCase):

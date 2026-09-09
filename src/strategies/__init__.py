@@ -1,3 +1,4 @@
+from .adaptive_timing import AdaptiveTimingStrategy
 from .ai_prompt import AIPromptStrategy
 from .base import BaseStrategy, Signal, StrategyContext
 from .breakout_retest import BreakoutRetestStrategy
@@ -19,6 +20,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "ai_prompt": AIPromptStrategy,
     "favorite_bias": FavoriteBiasStrategy,
     "prior_window_momentum": PriorWindowMomentumStrategy,
+    "adaptive_timing": AdaptiveTimingStrategy,
 }
 
 __all__ = [
@@ -34,5 +36,6 @@ __all__ = [
     "AIPromptStrategy",
     "FavoriteBiasStrategy",
     "PriorWindowMomentumStrategy",
+    "AdaptiveTimingStrategy",
     "STRATEGY_REGISTRY",
 ]

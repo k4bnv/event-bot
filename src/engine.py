@@ -98,7 +98,7 @@ class Engine:
         self._build_wallets_and_strategies()
 
     @staticmethod
-    def _wallet_key(strategy_name: str, window_min: int) -> str:
+    def _wallet_key(strategy_name: str, window_min: Optional[int] = None) -> str:
         """Every configured entry_windows_min checkpoint gets its OWN
         wallet — not just its own stats row (build_combo_stats already
         did that from trade data alone) but its own actual capital, so
@@ -107,13 +107,22 @@ class Engine:
         from, and feeding wins back into, one shared pool. This composite
         string is the ONE place that format is decided — Storage persists
         it verbatim as the wallets table's primary key (see
-        write_snapshot/load_wallets)."""
-        return f"{strategy_name}:{window_min}"
+        write_snapshot/load_wallets).
 
-    def wallet_for(self, strategy_name: str, window_min: int) -> VirtualWallet:
+        window_min=None (only for a `dynamic_timing` strategy — see
+        StrategyConfig.dynamic_timing) collapses this to the bare strategy
+        name instead: such a strategy gets exactly ONE wallet regardless
+        of how many checkpoints it's actually called at, since it places
+        at most one trade per market no matter which checkpoint that
+        happens on. Never collides with a per-checkpoint key, which always
+        contains ':'."""
+        return strategy_name if window_min is None else f"{strategy_name}:{window_min}"
+
+    def wallet_for(self, strategy_name: str, window_min: Optional[int] = None) -> VirtualWallet:
         """Convenience accessor mirroring _wallet_key — mainly for tests
         and any future code that needs one specific checkpoint's wallet
-        rather than iterating self.wallets directly."""
+        (or, for a dynamic_timing strategy, its one shared wallet) rather
+        than iterating self.wallets directly."""
         return self.wallets[self._wallet_key(strategy_name, window_min)]
 
     def _build_wallets_and_strategies(self) -> None:
@@ -142,9 +151,19 @@ class Engine:
             # configured entry checkpoints gets that same full deposit_usd
             # again, independently — not a further split of it — so "12
             # мин" and "2 мин" are judged on equal starting terms too.
-            for window_min in s_cfg.entry_windows_min:
-                key = self._wallet_key(s_cfg.name, window_min)
-                self.wallets[key] = self._restore_or_create_wallet(s_cfg, window_min, saved_wallets.get(key))
+            #
+            # Exception: dynamic_timing strategies (see adaptive_timing)
+            # place at most one trade per market no matter which of their
+            # (usually many, densely-spaced) checkpoints it happens on —
+            # splitting capital N ways there would leave N-1 wallets
+            # permanently idle. They get exactly ONE wallet instead.
+            if s_cfg.dynamic_timing:
+                key = self._wallet_key(s_cfg.name)
+                self.wallets[key] = self._restore_or_create_wallet(s_cfg, None, saved_wallets.get(key))
+            else:
+                for window_min in s_cfg.entry_windows_min:
+                    key = self._wallet_key(s_cfg.name, window_min)
+                    self.wallets[key] = self._restore_or_create_wallet(s_cfg, window_min, saved_wallets.get(key))
 
             strat_cls = STRATEGY_REGISTRY.get(s_cfg.name)
             if strat_cls is None:
@@ -157,7 +176,7 @@ class Engine:
             )
 
     @staticmethod
-    def _restore_or_create_wallet(s_cfg, window_min: int, saved: Optional[dict]) -> VirtualWallet:
+    def _restore_or_create_wallet(s_cfg, window_min: Optional[int], saved: Optional[dict]) -> VirtualWallet:
         """A fresh VirtualWallet(deposit_usd) for this ONE checkpoint if
         `saved` is None (first-ever launch, a checkpoint just added to
         entry_windows_min, or one just reset) — otherwise resumes the
@@ -188,10 +207,11 @@ class Engine:
         )
         wallet.balance = saved["balance"] + saved["reserved"]
         if saved["reserved"]:
+            window_label = f"{window_min} мин" if window_min is not None else "динамический тайминг"
             logger.warning(
-                "Strategy '%s' (%s мин): restarted with $%.2f still reserved in-flight at the last "
+                "Strategy '%s' (%s): restarted with $%.2f still reserved in-flight at the last "
                 "snapshot — refunded to balance (its open trade(s) can't be resumed across a restart).",
-                s_cfg.name, window_min, saved["reserved"],
+                s_cfg.name, window_label, saved["reserved"],
             )
         return wallet
 
@@ -278,11 +298,15 @@ class Engine:
 
         old_strategy = self.strategy_instances.get(name)
         prefix = f"{name}:"
-        for key in [k for k in self.wallets if k.startswith(prefix)]:
+        for key in [k for k in self.wallets if k == name or k.startswith(prefix)]:
             del self.wallets[key]
-        for window_min in s_cfg.entry_windows_min:
-            key = self._wallet_key(name, window_min)
-            self.wallets[key] = VirtualWallet(strategy=name, window_min=window_min, initial_balance=s_cfg.deposit_usd)
+        if s_cfg.dynamic_timing:
+            key = self._wallet_key(name)
+            self.wallets[key] = VirtualWallet(strategy=name, window_min=None, initial_balance=s_cfg.deposit_usd)
+        else:
+            for window_min in s_cfg.entry_windows_min:
+                key = self._wallet_key(name, window_min)
+                self.wallets[key] = VirtualWallet(strategy=name, window_min=window_min, initial_balance=s_cfg.deposit_usd)
         strat_cls = STRATEGY_REGISTRY[name]
         self.strategy_instances[name] = strat_cls(config=dict(s_cfg.extra))
         if old_strategy is not None:
@@ -534,13 +558,21 @@ class Engine:
                     # strategy, since that's exactly the isolation this
                     # split is for: "12 мин" stakes/wins/loses out of its
                     # own pool, completely independent of "2 мин"'s.
-                    wallet = self.wallets[self._wallet_key(s_cfg.name, window_min)]
+                    # dynamic_timing strategies collapse to their one
+                    # shared wallet instead (see _wallet_key).
+                    wallet_key_window = None if s_cfg.dynamic_timing else window_min
+                    wallet = self.wallets[self._wallet_key(s_cfg.name, wallet_key_window)]
+                    already_open_this_market = any(
+                        t.series_id == series_id and t.expiry_ts == market.expiry_ts
+                        for t in wallet.open_trades()
+                    )
                     ctx = StrategyContext(
                         price_history=self.provider.btc_price_history(),
                         orderbook=self.provider.btc_orderbook(),
                         remaining_sec=remaining, window_min=window_min,
                         market=market, funding_rate=self.provider.funding_rate(),
                         previous_outcome=self._previous_outcome.get(series_id),
+                        already_open_this_market=already_open_this_market,
                     )
                     signal = await strategy.evaluate(ctx)
                     if signal is None:
