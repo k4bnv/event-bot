@@ -36,7 +36,7 @@ class ChatAPIError(Exception):
 class ChatClientConfig:
     api_key: str
     base_url: str                      # e.g. https://router.requesty.ai/v1 or https://api.deepseek.com
-    model: str                          # e.g. "anthropic/claude-haiku-4-5-20251001" (Requesty) or "deepseek-chat"
+    model: str                          # e.g. "anthropic/claude-haiku-4-5" (Requesty) or "deepseek-chat"
     timeout_sec: float = 20.0
     use_json_response_format: bool = True   # disable if your chosen model/gateway rejects this param
 

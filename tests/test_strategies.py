@@ -357,7 +357,7 @@ class BuildClientConfigTests(unittest.TestCase):
         self.assertIsNotNone(cfg)
         self.assertEqual(cfg.api_key, "rk-test")
         self.assertEqual(cfg.base_url, "https://router.requesty.ai/v1")
-        self.assertEqual(cfg.model, "anthropic/claude-haiku-4-5-20251001")
+        self.assertEqual(cfg.model, "anthropic/claude-haiku-4-5")
 
     def test_requesty_model_override_from_config_wins_over_env(self):
         os.environ["REQUESTY_API_KEY"] = "rk-test"

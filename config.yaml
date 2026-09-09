@@ -61,8 +61,11 @@ strategies:
     max_coefficient: 0.55             # never buy a contract priced above this
     stake_fraction: 0.01              # fraction of strategy wallet per trade
     impulse_lookback_sec: 90
-    impulse_threshold_pct: 0.12       # % move that counts as an "impulse"
-    retest_tolerance_pct: 0.05        # how close price must return to the level
+    impulse_threshold_pct: 0.08       # % move that counts as an "impulse" (was 0.12 — 0 trades
+                                       # in the first ~17h live; loosened to actually get signal)
+    retest_tolerance_pct: 0.10        # how close price must return to the level (was 0.05 — the
+                                       # tighter number is likely the bigger bottleneck of the two:
+                                       # impulse+retest is a rare joint event even before this)
 
   orderbook_momentum:
     enabled: true
@@ -93,9 +96,11 @@ strategies:
     stake_fraction: 0.01
     breakout_lookback_sec: 60           # window checked for the impulse+retest itself
     vol_lookback_sec: 300               # baseline window BEFORE that, used only to size the threshold
-    vol_multiplier: 2.5                 # threshold = vol_multiplier * baseline realized_vol_pct
+    vol_multiplier: 2.0                 # threshold = vol_multiplier * baseline realized_vol_pct (was 2.5)
     min_threshold_pct: 0.03             # floor, so near-zero volatility doesn't trigger on noise
-    retest_tolerance_mult: 0.4          # tolerance = threshold_pct * this
+    retest_tolerance_mult: 0.6          # tolerance = threshold_pct * this (was 0.4 — same reasoning
+                                         # as breakout_retest above: the retest band is the likelier
+                                         # bottleneck, not the impulse threshold itself)
 
   fair_value_edge:
     enabled: true
@@ -144,7 +149,7 @@ strategies:
     # variants too (lower priority = higher latency) — bad fit when the decision
     # must land before the contract's expiry. Good options via Requesty:
     # "google/gemini-3.1-flash-lite" (cheapest/fastest, default below),
-    # "anthropic/claude-haiku-4-5-20251001" (pricier, best text/news interpretation),
+    # "anthropic/claude-haiku-4-5" (pricier, best text/news interpretation),
     # "deepseek/deepseek-chat" (also cheap, usually slower than the other two).
     model: "google/gemini-3.1-flash-lite"
     lookback_sec: 180

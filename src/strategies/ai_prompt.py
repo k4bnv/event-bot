@@ -14,7 +14,7 @@ Provider: `strategies.ai_prompt.provider` in config.yaml selects which
 OpenAI-compatible gateway/env vars to use —
   * "requesty" (default) — https://router.requesty.ai/v1, one API key
     (REQUESTY_API_KEY) routes to 600+ models from any provider, addressed
-    as "provider/model" (e.g. "anthropic/claude-haiku-4-5-20251001",
+    as "provider/model" (e.g. "anthropic/claude-haiku-4-5",
     "google/gemini-2.5-flash-lite", "deepseek/deepseek-chat"). See
     https://docs.requesty.ai/features/supported-models for the current
     catalog/pricing before picking a model.
@@ -101,7 +101,7 @@ BARRIER_PROMPT_TEMPLATE = (
 
 # provider -> (api_key env var, default base_url, default model)
 _PROVIDER_DEFAULTS = {
-    "requesty": ("REQUESTY_API_KEY", "https://router.requesty.ai/v1", "anthropic/claude-haiku-4-5-20251001"),
+    "requesty": ("REQUESTY_API_KEY", "https://router.requesty.ai/v1", "anthropic/claude-haiku-4-5"),
     "deepseek": ("DEEPSEEK_API_KEY", "https://api.deepseek.com", "deepseek-chat"),
     "openai_compatible": ("OPENAI_COMPATIBLE_API_KEY", "", ""),
 }
