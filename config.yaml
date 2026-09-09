@@ -155,7 +155,18 @@ strategies:
     enabled: true
     display_name: "G: AI Prompt"
     deposit_usd: 100
-    entry_windows_min: [2]             # one checkpoint (closest to expiry) -> fewest paid calls
+    # Two checkpoints: "2" (original — closest to expiry, highest
+    # confidence but the contract is often already extreme/thin by then,
+    # so a real edge computed against the quoted price frequently gets
+    # rejected once the honest fill price is checked — seen live) and
+    # "4" (earlier, both series still have it: 4<5 on 5MIN too), where
+    # the contract is usually closer to 0.5 and less likely to blow past
+    # max_coefficient. Cooldown is now keyed per (series, checkpoint) —
+    # see ai_prompt.py's __init__ docstring — so these two, and both
+    # series, each get an independent chance to fire rather than one
+    # shared timer starving the rest. max_calls_per_day below is what
+    # actually caps spend now.
+    entry_windows_min: [4, 2]
     max_coefficient: 0.6
     stake_fraction: 0.01
     # provider: requesty (router.requesty.ai, one key -> 600+ models, "provider/model"

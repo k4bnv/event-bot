@@ -172,7 +172,23 @@ class AIPromptStrategy(BaseStrategy):
 
     def __init__(self, config: dict, client: Optional["ChatClient"] = None):
         super().__init__(config)
-        self._last_call_ts = 0.0
+        # Keyed by "series_id:window_min", NOT a single shared timestamp —
+        # a single float cooldown meant one series/checkpoint firing could
+        # silently eat the whole strategy's budget and block every OTHER
+        # series/checkpoint for min_seconds_between_calls, even though
+        # EntryWindowManager already guarantees each one is only ever due
+        # once per window on its own. Concretely: with entry_windows_min
+        # covering more than one checkpoint (e.g. [4, 2]) and two series
+        # (5MIN/15MIN) both configured, a shared cooldown meant whichever
+        # fired first could starve the rest for 5 minutes — on a 5-minute
+        # window, the "2" checkpoint would then NEVER get a real chance,
+        # since it's due only ~2 minutes after "4". Keying per (series,
+        # checkpoint) lets every configured slot actually get evaluated
+        # every time it's due; max_calls_per_day remains the real, only
+        # cost ceiling (see below) — this cooldown is now just a per-slot
+        # safety net, effectively redundant with EntryWindowManager's own
+        # once-per-window dedup rather than a meaningful spend throttle.
+        self._last_call_ts: dict[str, float] = {}
         self._warned_no_key = False
         self._warned_budget = False
         self._call_times: deque[float] = deque()  # for the rolling 24h call-count cap
@@ -204,7 +220,8 @@ class AIPromptStrategy(BaseStrategy):
 
         min_gap = float(self.config.get("min_seconds_between_calls", 300))
         now = time.time()
-        if now - self._last_call_ts < min_gap:
+        cooldown_key = f"{ctx.market.series_id}:{ctx.window_min}"
+        if now - self._last_call_ts.get(cooldown_key, 0.0) < min_gap:
             return None
 
         # Hard ceiling on API spend, independent of the cooldown above and
@@ -238,7 +255,7 @@ class AIPromptStrategy(BaseStrategy):
             logger.warning("ai_prompt: LLM call failed, skipping this checkpoint: %s", exc)
             return None
         finally:
-            self._last_call_ts = now
+            self._last_call_ts[cooldown_key] = now
 
         logger.info("ai_prompt raw response: %s", raw[:500])
         return self._parse_response(raw, ctx.market)

@@ -297,6 +297,58 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(second)   # cooldown -> no signal, and no extra API call
         self.assertEqual(fake.calls, 1)
 
+    async def test_cooldown_is_independent_per_series(self):
+        # Real bug this fixes: a single shared cooldown meant one series
+        # firing could starve every OTHER series for min_seconds_between_calls,
+        # even though EntryWindowManager already guarantees each is only
+        # ever due once per window on its own.
+        fake = FakeChatClient([
+            '{"direction": "UP", "confidence": 0.6, "reason": "5min"}',
+            '{"direction": "UP", "confidence": 0.6, "reason": "15min"}',
+        ])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 9999}, client=fake)
+        market_5min = make_market(up_price=0.5)
+        market_5min.series_id = "BTC-UPDOWN-5MIN"
+        market_15min = make_market(up_price=0.5)
+        market_15min.series_id = "BTC-UPDOWN-15MIN"
+
+        first = await strategy.evaluate(make_ctx([], market=market_5min, window_min=2))
+        second = await strategy.evaluate(make_ctx([], market=market_15min, window_min=2))
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)  # different series -> NOT blocked by the other's cooldown
+        self.assertEqual(fake.calls, 2)
+
+    async def test_cooldown_is_independent_per_checkpoint(self):
+        # Same series, two different checkpoints (e.g. entry_windows_min:
+        # [4, 2]) firing minutes apart — neither should block the other,
+        # even well inside a long min_seconds_between_calls.
+        fake = FakeChatClient([
+            '{"direction": "UP", "confidence": 0.6, "reason": "4min-out"}',
+            '{"direction": "UP", "confidence": 0.6, "reason": "2min-out"}',
+        ])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 9999}, client=fake)
+        market = self.LIVE_MARKET()
+
+        first = await strategy.evaluate(make_ctx([], market=market, window_min=4))
+        second = await strategy.evaluate(make_ctx([], market=market, window_min=2))
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)  # different checkpoint on the same series -> not blocked
+        self.assertEqual(fake.calls, 2)
+
+    async def test_cooldown_still_blocks_the_exact_same_series_and_checkpoint(self):
+        fake = FakeChatClient([
+            '{"direction": "UP", "confidence": 0.6, "reason": "a"}',
+            '{"direction": "UP", "confidence": 0.6, "reason": "b"}',
+        ])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 9999}, client=fake)
+        market = self.LIVE_MARKET()
+
+        first = await strategy.evaluate(make_ctx([], market=market, window_min=2))
+        second = await strategy.evaluate(make_ctx([], market=market, window_min=2))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)  # same series AND same checkpoint -> still cooled down
+        self.assertEqual(fake.calls, 1)
+
     async def test_daily_call_cap_blocks_further_calls(self):
         fake = FakeChatClient([
             '{"direction": "UP", "confidence": 0.6, "reason": "a"}',
