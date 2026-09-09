@@ -17,19 +17,22 @@ proxy) if you want the cookie itself protected in transit too.
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import hmac
+import io
 import os
 import time
 from typing import Any, Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import AppConfig
 from .engine import Engine
+from .storage import TRADE_FIELDS
 
 AUTH_COOKIE_NAME = "okx_bot_session"
 AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days — "куки хранились"
@@ -190,9 +193,23 @@ INDEX_HTML = """<!doctype html>
   .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; margin-top:8px; }
   .legend-item { display:flex; align-items:center; gap:6px; }
   .legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; }
-  .analytics-controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; font-size:13px; }
+  .analytics-controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; font-size:13px; flex-wrap:wrap; }
   .analytics-controls select { background:#0f1115; color:#e6e6e6; border:1px solid #2a2e37;
     border-radius:5px; padding:4px 8px; }
+  #exportCsvBtn { background:#171a21; color:#7fc7ff; border:1px solid #2b4a6b; border-radius:6px;
+    padding:5px 12px; font-size:12px; cursor:pointer; }
+  #exportCsvBtn:hover { background:#1f2e3a; }
+  .trades-stats { font-size:12px; color:#9aa0a6; margin-bottom:10px; }
+  .table-scroll { overflow-x:auto; }
+  #tradesTable th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
+  #tradesTable th.sortable:hover { color:#e6e6e6; }
+  #tradesTable th .sort-arrow { color:#7fc7ff; margin-left:3px; }
+  .pager { display:flex; align-items:center; gap:10px; margin-top:12px; font-size:13px; }
+  .pager button { background:#171a21; color:#9aa0a6; border:1px solid #23262e; border-radius:6px;
+    padding:4px 12px; font-size:12px; cursor:pointer; }
+  .pager button:hover:not(:disabled) { background:#1f232b; }
+  .pager button:disabled { opacity:0.4; cursor:default; }
+  .reason-cell { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left !important; }
 </style>
 </head>
 <body>
@@ -227,10 +244,13 @@ INDEX_HTML = """<!doctype html>
       <h3>История сделок</h3>
       <div class="analytics-controls">
         <label>Стратегия:
-          <select id="tradesFilter" onchange="loadTradesTable()"><option value="">Все</option></select>
+          <select id="tradesFilter" onchange="onTradesFilterChange()"><option value="">Все</option></select>
         </label>
+        <button id="exportCsvBtn" onclick="exportTradesCsv()">⬇ Экспорт CSV</button>
       </div>
-      <table id="tradesTable"></table>
+      <div id="tradesStats" class="trades-stats"></div>
+      <div class="table-scroll"><table id="tradesTable"></table></div>
+      <div class="pager" id="tradesPager"></div>
     </div>
   </div>
 
@@ -246,6 +266,25 @@ function cls(v){ return v>0?'pos':(v<0?'neg':''); }
 let currentTab = 'dashboard';
 let strategySettingsLoaded = false;
 let tradesFilterLoaded = false;
+let tradesPage = 0;
+let tradesSortBy = 'closed_ts';
+let tradesSortDir = 'desc';
+const TRADES_PAGE_SIZE = 50;
+const TRADE_COLUMNS = [
+  { key: 'closed_ts', label: 'Закрыта' },
+  { key: 'opened_ts', label: 'Открыта' },
+  { key: 'strategy', label: 'Стратегия' },
+  { key: 'entry_window_min', label: 'Окно' },
+  { key: 'inst_id', label: 'Инструмент' },
+  { key: 'direction', label: 'Напр.' },
+  { key: 'entry_price', label: 'Вход' },
+  { key: 'stake_usd', label: 'Стейк' },
+  { key: 'duration_sec', label: 'Длит.' },
+  { key: 'status', label: 'Статус' },
+  { key: 'pnl_usd', label: 'PnL' },
+  { key: 'roi_pct', label: 'ROI %' },
+  { key: 'reason', label: 'Причина' },
+];
 const PALETTE = ['#7fc7ff', '#3ddc84', '#ffb84d', '#ff6b6b', '#c792ea', '#4dd0e1', '#f06292', '#a1887f'];
 
 function showTab(tab){
@@ -276,22 +315,92 @@ async function loadTradesFilterOptions(){
   tradesFilterLoaded = true;
 }
 
+function onTradesFilterChange(){
+  tradesPage = 0;
+  loadTradesTable();
+}
+
+function onTradesSort(key){
+  if (tradesSortBy === key) {
+    tradesSortDir = tradesSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    tradesSortBy = key;
+    tradesSortDir = 'desc';
+  }
+  tradesPage = 0;
+  loadTradesTable();
+}
+
+function tradesGoPage(page){
+  tradesPage = Math.max(0, page);
+  loadTradesTable();
+}
+
+function fmtDuration(sec){
+  if (sec == null || isNaN(sec)) return '—';
+  sec = Math.max(0, Math.round(sec));
+  return `${Math.floor(sec / 60)}м ${sec % 60}с`;
+}
+
+function tradesHeaderRow(){
+  return '<tr>' + TRADE_COLUMNS.map(c => {
+    const arrow = tradesSortBy === c.key ? `<span class="sort-arrow">${tradesSortDir === 'asc' ? '▲' : '▼'}</span>` : '';
+    return `<th class="sortable" onclick="onTradesSort('${c.key}')">${c.label}${arrow}</th>`;
+  }).join('') + '</tr>';
+}
+
+function renderTradesPager(total){
+  const totalPages = Math.max(1, Math.ceil(total / TRADES_PAGE_SIZE));
+  const page = tradesPage + 1;
+  document.getElementById('tradesPager').innerHTML = `
+    <button onclick="tradesGoPage(0)" ${tradesPage === 0 ? 'disabled' : ''}>« Первая</button>
+    <button onclick="tradesGoPage(${tradesPage - 1})" ${tradesPage === 0 ? 'disabled' : ''}>‹ Пред.</button>
+    <span>Стр. ${page} из ${totalPages} (${total} сделок)</span>
+    <button onclick="tradesGoPage(${tradesPage + 1})" ${page >= totalPages ? 'disabled' : ''}>След. ›</button>
+    <button onclick="tradesGoPage(${totalPages - 1})" ${page >= totalPages ? 'disabled' : ''}>Последняя »</button>
+  `;
+}
+
+function exportTradesCsv(){
+  const strategy = document.getElementById('tradesFilter').value;
+  const params = new URLSearchParams({ sort_by: tradesSortBy, sort_dir: tradesSortDir });
+  if (strategy) params.set('strategy', strategy);
+  window.location.href = '/api/trades/export.csv?' + params.toString();
+}
+
 async function loadTradesTable(){
   const strategy = document.getElementById('tradesFilter').value;
-  const url = strategy ? `/api/trades?strategy=${encodeURIComponent(strategy)}&limit=200` : '/api/trades?limit=200';
-  const r = await fetch(url);
-  const rows = await r.json();
-  let html = '<tr><th>Закрыта</th><th>Стратегия</th><th>Окно</th><th>Инструмент</th>' +
-             '<th>Напр.</th><th>Вход</th><th>Стейк</th><th>Статус</th><th>PnL</th></tr>';
-  for (const t of rows) {
+  const params = new URLSearchParams({
+    limit: TRADES_PAGE_SIZE, offset: tradesPage * TRADES_PAGE_SIZE,
+    sort_by: tradesSortBy, sort_dir: tradesSortDir,
+  });
+  if (strategy) params.set('strategy', strategy);
+  const r = await fetch('/api/trades?' + params.toString());
+  const d = await r.json();
+
+  let html = tradesHeaderRow();
+  for (const t of d.rows) {
     const closedAt = t.closed_ts ? new Date(t.closed_ts * 1000).toLocaleString() : '—';
+    const openedAt = t.opened_ts ? new Date(t.opened_ts * 1000).toLocaleString() : '—';
     const pnl = t.pnl_usd ?? 0;
-    html += `<tr><td>${closedAt}</td><td>${t.strategy}</td><td>${t.entry_window_min} мин</td>
-             <td>${t.inst_id}</td><td>${t.direction}</td><td>$${Number(t.entry_price).toFixed(3)}</td>
-             <td>$${Number(t.stake_usd).toFixed(2)}</td><td>${t.status}</td>
-             <td class="${cls(pnl)}">${money(pnl)}</td></tr>`;
+    const roi = t.stake_usd > 0 ? (pnl / t.stake_usd * 100) : 0;
+    const duration = (t.closed_ts && t.opened_ts) ? t.closed_ts - t.opened_ts : null;
+    html += `<tr>
+      <td>${closedAt}</td><td>${openedAt}</td><td>${t.strategy}</td><td>${t.entry_window_min} мин</td>
+      <td>${t.inst_id}</td><td>${t.direction}</td><td>$${Number(t.entry_price).toFixed(3)}</td>
+      <td>$${Number(t.stake_usd).toFixed(2)}</td><td>${fmtDuration(duration)}</td><td>${t.status}</td>
+      <td class="${cls(pnl)}">${money(pnl)}</td><td class="${cls(roi)}">${roi.toFixed(1)}%</td>
+      <td class="reason-cell" title="${escapeHtml(t.reason || '')}">${escapeHtml(t.reason || '—')}</td>
+    </tr>`;
   }
   document.getElementById('tradesTable').innerHTML = html;
+
+  const st = d.stats;
+  document.getElementById('tradesStats').textContent = st.total
+    ? `Всего: ${st.total} сделок (${st.wins}W/${st.losses}L, winrate ${st.winrate_pct.toFixed(1)}%) — суммарный PnL: ${money(st.net_pnl)}`
+    : 'Нет закрытых сделок по этому фильтру';
+
+  renderTradesPager(d.total);
 }
 
 // -- tiny inline-SVG charts (no charting library) ----------------------------------
@@ -737,12 +846,45 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
         )
 
     @app.get("/api/trades")
-    async def get_trades(strategy: Optional[str] = None, limit: int = 200) -> JSONResponse:
-        """Raw closed-trade history for the Analytics tab's table — reads
-        from the durable SQLite log (data/bot.db), not just this
-        process's in-memory state, so it also reflects rows from before
-        the last restart."""
-        rows = engine.storage.get_trades(strategy=strategy, limit=min(max(limit, 1), 1000))
-        return JSONResponse(rows)
+    async def get_trades(
+        strategy: Optional[str] = None, limit: int = 50, offset: int = 0,
+        sort_by: str = "closed_ts", sort_dir: str = "desc",
+    ) -> JSONResponse:
+        """Paginated, sortable closed-trade history for the Analytics tab's
+        table — reads from the durable SQLite log (data/bot.db), not just
+        this process's in-memory state, so it also reflects rows from
+        before the last restart. `total`/`stats` are computed over every
+        row matching the filter, not just the current page, so the
+        pager and the summary line stay accurate regardless of page size."""
+        limit = min(max(limit, 1), 1000)
+        offset = max(offset, 0)
+        rows = engine.storage.get_trades(
+            strategy=strategy, limit=limit, offset=offset, sort_by=sort_by, sort_dir=sort_dir
+        )
+        return JSONResponse(
+            {
+                "rows": rows,
+                "total": engine.storage.count_trades(strategy=strategy),
+                "stats": engine.storage.trades_stats(strategy=strategy),
+            }
+        )
+
+    @app.get("/api/trades/export.csv")
+    async def export_trades_csv(
+        strategy: Optional[str] = None, sort_by: str = "closed_ts", sort_dir: str = "desc",
+    ) -> StreamingResponse:
+        """Full closed-trade history (every row matching the filter, not
+        just one page) as a downloadable CSV — same filter/sort as the
+        on-screen table, but unpaginated."""
+        rows = engine.storage.get_trades(strategy=strategy, limit=None, sort_by=sort_by, sort_dir=sort_dir)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=TRADE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+        filename = f"trades_{strategy or 'all'}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        return StreamingResponse(
+            iter([buf.getvalue()]), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     return app

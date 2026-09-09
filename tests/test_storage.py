@@ -103,6 +103,62 @@ class StorageResetTests(unittest.TestCase):
             self.assertEqual(storage.get_trades(strategy="nonexistent"), [])
             storage.close()
 
+    def test_get_trades_sort_and_paginate(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            wallet = VirtualWallet(strategy="a", initial_balance=1000.0)
+            trades = []
+            for i, (won, stake) in enumerate([(True, 10.0), (False, 20.0), (True, 30.0)]):
+                t = make_settled_trade("a")
+                t.stake_usd = stake
+                t.contracts = stake / t.entry_price
+                wallet.open_trade(t)
+                wallet.settle_trade(t, won=won)
+                t.closed_ts = 1000.0 + i  # deterministic order
+                trades.append(t)
+            storage.append_closed_trades({"a": wallet})
+
+            # ascending by pnl_usd: the loss (negative pnl) sorts first
+            rows = storage.get_trades(sort_by="pnl_usd", sort_dir="asc")
+            self.assertEqual(rows[0]["id"], trades[1].id)
+
+            # an unknown/unsafe sort_by falls back to closed_ts, doesn't raise
+            rows = storage.get_trades(sort_by="id; DROP TABLE trades;--", sort_dir="desc")
+            self.assertEqual(len(rows), 3)
+
+            # pagination: limit+offset walks the (default closed_ts DESC) order
+            page1 = storage.get_trades(limit=2, offset=0)
+            page2 = storage.get_trades(limit=2, offset=2)
+            self.assertEqual([r["id"] for r in page1], [trades[2].id, trades[1].id])
+            self.assertEqual([r["id"] for r in page2], [trades[0].id])
+
+            self.assertEqual(storage.count_trades(), 3)
+            self.assertEqual(storage.count_trades(strategy="nonexistent"), 0)
+            storage.close()
+
+    def test_trades_stats_aggregates_all_matching_rows(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            wallet = VirtualWallet(strategy="a", initial_balance=1000.0)
+            t1 = make_settled_trade("a")
+            wallet.open_trade(t1)
+            wallet.settle_trade(t1, won=True)   # pnl = +15.0 (25 contracts - 10 stake)
+            t2 = make_settled_trade("a")
+            wallet.open_trade(t2)
+            wallet.settle_trade(t2, won=False)  # pnl = -10.0
+            storage.append_closed_trades({"a": wallet})
+
+            stats = storage.trades_stats(strategy="a")
+            self.assertEqual(stats["total"], 2)
+            self.assertEqual(stats["wins"], 1)
+            self.assertEqual(stats["losses"], 1)
+            self.assertAlmostEqual(stats["winrate_pct"], 50.0)
+            self.assertAlmostEqual(stats["net_pnl"], 5.0)  # +15 - 10
+
+            empty = storage.trades_stats(strategy="nonexistent")
+            self.assertEqual(empty, {"total": 0, "wins": 0, "losses": 0, "winrate_pct": 0.0, "net_pnl": 0})
+            storage.close()
+
 
 if __name__ == "__main__":
     unittest.main()

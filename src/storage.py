@@ -31,6 +31,23 @@ TRADE_FIELDS = [
     "closed_ts", "status", "pnl_usd", "reason",
 ]
 
+# Whitelisted for ORDER BY — these become raw SQL identifiers below (via an
+# f-string), so only column names actually in the `trades` table may appear
+# here. Never build sort_by from unvalidated input.
+SORTABLE_TRADE_COLUMNS = {
+    "closed_ts", "opened_ts", "strategy", "entry_window_min", "series_id",
+    "inst_id", "direction", "entry_price", "stake_usd", "contracts",
+    "expiry_ts", "status", "pnl_usd", "reason",
+}
+
+# A couple of sort keys the dashboard exposes that aren't raw columns —
+# fixed literal SQL expressions (never built from request input), so
+# splicing them into the query is as safe as a whitelisted column name.
+_SORT_EXPRESSIONS = {
+    "roi_pct": "(CASE WHEN stake_usd > 0 THEN pnl_usd / stake_usd ELSE 0 END)",
+    "duration_sec": "(closed_ts - opened_ts)",
+}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
     id TEXT PRIMARY KEY,
@@ -132,19 +149,75 @@ class Storage:
         logger.warning("Storage reset for strategy '%s' only.", strategy)
 
     # -- reads (dashboard analytics) ------------------------------------------------
-    def get_trades(self, strategy: Optional[str] = None, limit: int = 200) -> list[dict]:
-        """Most-recently-closed trades first, optionally filtered to one
-        strategy. Backs the Analytics tab's raw trade table."""
-        if strategy:
-            cur = self._conn.execute(
-                "SELECT * FROM trades WHERE strategy = ? AND closed_ts IS NOT NULL "
-                "ORDER BY closed_ts DESC LIMIT ?",
-                (strategy, limit),
-            )
+    def get_trades(
+        self, strategy: Optional[str] = None, limit: Optional[int] = 200, offset: int = 0,
+        sort_by: str = "closed_ts", sort_dir: str = "desc",
+    ) -> list[dict]:
+        """Closed trades (won/lost/unresolved), optionally filtered to one
+        strategy, sorted/paginated. Backs the Analytics tab's trade table
+        and its CSV export. `limit=None` returns every matching row (used
+        by the CSV export, which shouldn't silently truncate history) —
+        pass an int for a UI page. `sort_by` is checked against
+        SORTABLE_TRADE_COLUMNS (falls back to closed_ts) before it's
+        spliced into the query, so this is never raw user input reaching SQL."""
+        if sort_by in _SORT_EXPRESSIONS:
+            col = _SORT_EXPRESSIONS[sort_by]
+        elif sort_by in SORTABLE_TRADE_COLUMNS:
+            col = sort_by
         else:
-            cur = self._conn.execute(
-                "SELECT * FROM trades WHERE closed_ts IS NOT NULL ORDER BY closed_ts DESC LIMIT ?",
-                (limit,),
-            )
+            col = "closed_ts"
+        direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
+
+        where = "WHERE closed_ts IS NOT NULL"
+        params: list = []
+        if strategy:
+            where += " AND strategy = ?"
+            params.append(strategy)
+
+        # secondary key (id) keeps ties in a stable order across pages —
+        # otherwise equal-timestamp rows could shuffle between requests.
+        query = f"SELECT * FROM trades {where} ORDER BY {col} {direction}, id {direction}"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params += [limit, offset]
+
+        cur = self._conn.execute(query, params)
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def count_trades(self, strategy: Optional[str] = None) -> int:
+        """Total closed trades matching the filter — lets the dashboard
+        compute page count without fetching every row."""
+        if strategy:
+            cur = self._conn.execute(
+                "SELECT COUNT(*) FROM trades WHERE closed_ts IS NOT NULL AND strategy = ?", (strategy,)
+            )
+        else:
+            cur = self._conn.execute("SELECT COUNT(*) FROM trades WHERE closed_ts IS NOT NULL")
+        return cur.fetchone()[0]
+
+    def trades_stats(self, strategy: Optional[str] = None) -> dict:
+        """Aggregate win/loss/PnL over EVERY matching closed trade (not just
+        the current page) — powers the small summary line under the
+        Analytics trade table so filtering/paging doesn't hide the
+        overall picture."""
+        where = "WHERE closed_ts IS NOT NULL AND status IN ('won', 'lost')"
+        params: list = []
+        if strategy:
+            where += " AND strategy = ?"
+            params.append(strategy)
+        cur = self._conn.execute(
+            f"SELECT COUNT(*), "
+            f"SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END), "
+            f"COALESCE(SUM(pnl_usd), 0) "
+            f"FROM trades {where}",
+            params,
+        )
+        total, wins, losses, net_pnl = cur.fetchone()
+        total, wins, losses = total or 0, wins or 0, losses or 0
+        return {
+            "total": total, "wins": wins, "losses": losses,
+            "winrate_pct": (wins / total * 100) if total else 0.0,
+            "net_pnl": net_pnl,
+        }
