@@ -96,7 +96,7 @@ BARRIER_PROMPT_TEMPLATE = (
     "Если дрейф и импульс разнонаправлены — коррекция близка к нулю.\n"
     "\n"
     '{"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,\n'
-    '"reason":"<макс 10 слов>"}'
+    '"reason":"<=6 слов"}'
 )
 
 # provider -> (api_key env var, default base_url, default model)

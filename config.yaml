@@ -164,7 +164,12 @@ strategies:
     price_sample_count: 8              # fewer price samples in the prompt = fewer input tokens
     min_seconds_between_calls: 300      # cooldown across ALL checkpoints/series, not just one
     max_calls_per_day: 100              # hard ceiling regardless of cooldown math above — the real safety net
-    max_tokens: 80                      # response is one short JSON object; no need for more
+    max_tokens: 160                     # was 80 — verified against a live call: the model's own
+                                         # JSON (base_prob/adjustment/prob_up/reason) plus a
+                                         # Russian-language reason easily blows past 80, response
+                                         # gets truncated mid-string and json.loads() fails every
+                                         # single time — a real signal (prob_up=0.101) was computed
+                                         # by the model and silently discarded. 160 leaves headroom.
     temperature: 0.2
     timeout_sec: 20
     # Free-text context handed to the model verbatim — this is the whole
@@ -203,7 +208,7 @@ strategies:
       Если дрейф и импульс разнонаправлены — коррекция близка к нулю.
 
       {"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,
-      "reason":"<макс 10 слов>"}
+      "reason":"<=6 слов"}
 
 # --- Dashboard -----------------------------------------------------------------
 dashboard:
