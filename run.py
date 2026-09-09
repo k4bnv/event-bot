@@ -77,6 +77,94 @@ async def discover_series(cfg) -> None:
         print("\nCopy the seriesId values you want into config.yaml -> okx.series_ids\n")
 
 
+async def check_liquidity(cfg) -> None:
+    """Utility mode: for every live Event Contract instrument currently open
+    on the configured series, print its real ticker (last/bidPx/askPx) and
+    top-of-book size, plus the computed bid/ask spread as both an absolute
+    (0.01-0.99 scale) and a percentage-of-mid figure.
+
+    Why this exists: the strategy engine simulates a fill at `last` (or the
+    bid/ask midpoint as a fallback — see market_data.py's
+    `_fetch_event_price`), with NO slippage/spread cost applied. On a thin
+    market that midpoint can be well away from what a real market order
+    would actually fill at. This command answers "how thin is it right
+    now?" using real, live OKX quotes — no simulation, no auth needed for
+    the ticker/books calls themselves (unlike the series/markets discovery
+    calls, which do need a signed request — see okx_client.py).
+    """
+    if not (cfg.okx.api_key and cfg.okx.api_secret and cfg.okx.api_passphrase):
+        print(
+            "--check-liquidity needs OKX API keys to discover which instId is "
+            "currently live per series (browsing event-contract markets requires "
+            "authentication even though it's read-only). Copy .env.example to .env "
+            "and fill in OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    client_cfg = OKXClientConfig(
+        base_url=cfg.okx.base_url, api_key=cfg.okx.api_key, api_secret=cfg.okx.api_secret,
+        api_passphrase=cfg.okx.api_passphrase, demo_trading=cfg.okx.demo_trading,
+        timeout_sec=cfg.okx.request_timeout_sec, max_retries=cfg.okx.max_retries,
+    )
+    async with OKXClient(client_cfg) as client:
+        for series_id in cfg.okx.series_ids:
+            try:
+                markets = await client.get_event_markets(series_id=series_id, state="live")
+            except Exception as exc:
+                print(f"{series_id}: failed to list live markets ({exc})")
+                continue
+            if not markets:
+                print(f"{series_id}: no live markets right now")
+                continue
+
+            # nearest-expiry instrument, same pick the engine itself trades
+            def _exp(m: dict) -> float:
+                raw = m.get("expTime")
+                try:
+                    return float(raw)
+                except (TypeError, ValueError):
+                    return float("inf")
+            chosen = min(markets, key=_exp)
+            inst_id = str(chosen.get("instId", "?"))
+
+            try:
+                ticker = await client.get_ticker(inst_id)
+                book = await client.get_orderbook(inst_id, sz=5)
+            except Exception as exc:
+                print(f"{series_id} ({inst_id}): failed to fetch ticker/book ({exc})")
+                continue
+
+            print(f"\n{series_id}  ->  {inst_id}")
+            if not ticker:
+                print("  ticker: <empty — no live quote>")
+            else:
+                row = ticker[0]
+                last, bid, ask = row.get("last"), row.get("bidPx"), row.get("askPx")
+                bid_sz, ask_sz = row.get("bidSz"), row.get("askSz")
+                print(f"  ticker: last={last}  bid={bid}({bid_sz})  ask={ask}({ask_sz})")
+                try:
+                    bid_f, ask_f = float(bid), float(ask)
+                    mid = (bid_f + ask_f) / 2
+                    spread_abs = ask_f - bid_f
+                    spread_pct = (spread_abs / mid * 100) if mid else float("nan")
+                    print(f"  spread: {spread_abs:.4f} absolute  ({spread_pct:.1f}% of mid {mid:.4f})")
+                    print(
+                        "  -> the engine would have simulated this fill at "
+                        f"last={last} (or mid={mid:.4f} if no trade yet) — "
+                        f"a REAL market buy would fill closer to ask={ask}, "
+                        f"a real sell closer to bid={bid}."
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if not book:
+                print("  book: <empty>")
+            else:
+                b = book[0]
+                print(f"  top bids: {b.get('bids', [])[:5]}")
+                print(f"  top asks: {b.get('asks', [])[:5]}")
+
+
 async def run_bot(cfg) -> None:
     storage = Storage(cfg.storage.data_dir)
 
@@ -168,6 +256,12 @@ def main() -> None:
         help="list live OKX EVENTS seriesId/instId values and exit (needs API keys or public access)",
     )
     parser.add_argument(
+        "--check-liquidity", action="store_true",
+        help="print real ticker + top-of-book bid/ask/spread for each series' current "
+             "live instrument and exit — shows how far a real market-order fill would be "
+             "from the last/mid price the engine simulates trades at",
+    )
+    parser.add_argument(
         "--reset-data", action="store_true",
         help="wipe data/bot.db (all strategies), then exit "
              "(equivalent to the web dashboard's Reset DB button, for console-mode users)",
@@ -184,6 +278,10 @@ def main() -> None:
 
     if args.discover_series:
         asyncio.run(discover_series(cfg))
+        return
+
+    if args.check_liquidity:
+        asyncio.run(check_liquidity(cfg))
         return
 
     if args.reset_data:
