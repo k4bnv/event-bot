@@ -9,16 +9,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Deque, Optional
 
 from .config import AppConfig
+from .features import pct_change_over
 from .market_data import MarketDataProvider
 from .metrics import ComboStats, Leaderboard, build_combo_stats, build_leaderboard
 from .models import Direction, Trade
 from .storage import Storage
 from .strategies import STRATEGY_REGISTRY, BaseStrategy, StrategyContext
+from .strategies.fair_value_edge import (
+    DEFAULT_MIN_SIGMA_PCT_PER_MIN, DEFAULT_UNFIXED_STRIKE_BASIS_PCT,
+    basis_sigma_for_market, compute_barrier_stats, min_sigma_per_sec_from_pct,
+)
 from .timing import EntryWindowManager
 from .wallet import VirtualWallet
 
@@ -379,6 +385,81 @@ class Engine:
                     self._last_outcome_check[series_id] = now
             self._last_inst_id[series_id] = market.inst_id
 
+    # -- ML feature logging ----------------------------------------------------------
+    def _record_checkpoint_features(
+        self, s_cfg, series_id: str, ctx: StrategyContext, signal, decision: str,
+        fill_price: Optional[float] = None, stake_usd: Optional[float] = None,
+        trade_id: Optional[str] = None,
+    ) -> None:
+        """One feature snapshot per (strategy, checkpoint) EVALUATION,
+        written to data/bot.db's checkpoint_features table regardless of
+        `decision` (no_signal/rejected-for-whatever-reason/opened alike)
+        — see storage.py's module docstring for why a dataset needs the
+        negative examples too, not just executed trades, to be any use
+        for future ML work. Reuses the same barrier-model machinery
+        fair_value_edge/ai_prompt already compute (z_score/base_prob/
+        sigma_horizon, with the volatility floor + basis-risk terms) so
+        the logged numbers mean the same thing everywhere they appear,
+        not a second, subtly different calculation.
+
+        Best-effort: wrapped in try/except so a logging failure can NEVER
+        take down real trading logic, matching this project's standing
+        rule for every strategy (ai_prompt's docstring states it most
+        explicitly, but it applies here just as much — this is pure
+        instrumentation, not something a trade decision should ever
+        depend on).
+        """
+        try:
+            market = ctx.market
+            points = list(ctx.price_history)
+            now = points[-1].ts if points else time.time()
+            spot = points[-1].price if points else None
+            barrier = (
+                compute_barrier_stats(
+                    points, spot, market.floor_strike, ctx.remaining_sec,
+                    min_sigma_per_sec=min_sigma_per_sec_from_pct(DEFAULT_MIN_SIGMA_PCT_PER_MIN),
+                    basis_sigma=basis_sigma_for_market(market, DEFAULT_UNFIXED_STRIKE_BASIS_PCT),
+                )
+                if spot is not None and market.floor_strike is not None else None
+            )
+            ob = ctx.orderbook
+            row = {
+                "id": uuid.uuid4().hex[:12],
+                "ts": now,
+                "strategy": s_cfg.name,
+                "series_id": series_id,
+                "inst_id": market.inst_id,
+                "window_min": ctx.window_min,
+                "remaining_sec": ctx.remaining_sec,
+                "market_method": market.method,
+                "up_price": market.up_price,
+                "floor_strike": market.floor_strike,
+                "strike_is_fixed": None if market.strike_is_fixed is None else int(market.strike_is_fixed),
+                "spot": spot,
+                "drift_5m_pct": pct_change_over(points, now, 300),
+                "mom_1m_pct": pct_change_over(points, now, 60),
+                "z_score": barrier.z_score if barrier else None,
+                "base_prob": barrier.base_prob if barrier else None,
+                "sigma_horizon_pct": barrier.sigma_horizon_pct if barrier else None,
+                "orderbook_bid_vol": ob.bid_volume(10) if ob else None,
+                "orderbook_ask_vol": ob.ask_volume(10) if ob else None,
+                "funding_rate": ctx.funding_rate,
+                "previous_outcome": ctx.previous_outcome.value if ctx.previous_outcome else None,
+                "signal_direction": signal.direction.value if signal else None,
+                "signal_confidence": signal.confidence if signal else None,
+                "signal_reason": signal.reason if signal else None,
+                "decision": decision,
+                "fill_price": fill_price,
+                "stake_usd": stake_usd,
+                "trade_id": trade_id,
+            }
+            self.storage.log_checkpoint_features(row)
+        except Exception:
+            logger.exception(
+                "Failed to log checkpoint features for %s/%s (decision=%s) — continuing.",
+                s_cfg.name, series_id, decision,
+            )
+
     # -- opening trades ------------------------------------------------------------
     async def _open_due_trades(self) -> None:
         now = time.time()
@@ -413,6 +494,7 @@ class Engine:
                     if signal is None:
                         logger.debug("%s: no signal at %dm-to-expiry for %s", s_cfg.name, window_min, series_id)
                         self._log_activity(s_cfg.name, series_id, window_min, "no_signal", "нет сигнала")
+                        self._record_checkpoint_features(s_cfg, series_id, ctx, None, "no_signal")
                         continue
 
                     inst_id = market.inst_id
@@ -426,6 +508,7 @@ class Engine:
                             s_cfg.name, series_id, window_min, "rejected",
                             f"{signal.direction.value.upper()} — нет живой котировки ({signal.reason})",
                         )
+                        self._record_checkpoint_features(s_cfg, series_id, ctx, signal, "rejected_no_quote")
                         continue
 
                     stake = round(wallet.balance * s_cfg.stake_fraction, 4)
@@ -434,6 +517,9 @@ class Engine:
                         self._log_activity(
                             s_cfg.name, series_id, window_min, "rejected",
                             f"баланс слишком мал для стейка (${wallet.balance:.2f})",
+                        )
+                        self._record_checkpoint_features(
+                            s_cfg, series_id, ctx, signal, "rejected_low_balance", stake_usd=stake,
                         )
                         continue
 
@@ -455,6 +541,9 @@ class Engine:
                             s_cfg.name, series_id, window_min, "rejected",
                             f"{signal.direction.value.upper()} — нет цены исполнения ({signal.reason})",
                         )
+                        self._record_checkpoint_features(
+                            s_cfg, series_id, ctx, signal, "rejected_no_fill_price", stake_usd=stake,
+                        )
                         continue
                     if price > s_cfg.max_coefficient:
                         logger.debug(
@@ -464,6 +553,10 @@ class Engine:
                         self._log_activity(
                             s_cfg.name, series_id, window_min, "rejected",
                             f"{signal.direction.value.upper()} @ {price:.3f} > лимит {s_cfg.max_coefficient:.2f} ({signal.reason})",
+                        )
+                        self._record_checkpoint_features(
+                            s_cfg, series_id, ctx, signal, "rejected_max_coefficient",
+                            fill_price=price, stake_usd=stake,
                         )
                         continue
 
@@ -489,6 +582,10 @@ class Engine:
                                     f"{signal.direction.value.upper()} — проскальзывание {slippage_pct:.0f}% "
                                     f"> лимита {s_cfg.max_slippage_pct:.0f}% (котировка {naive_price:.3f} -> {price:.3f})",
                                 )
+                                self._record_checkpoint_features(
+                                    s_cfg, series_id, ctx, signal, "rejected_max_slippage",
+                                    fill_price=price, stake_usd=stake,
+                                )
                                 continue
 
                     trade = Trade(
@@ -507,11 +604,19 @@ class Engine:
                             s_cfg.name, series_id, window_min, "opened",
                             f"{signal.direction.value.upper()} @ {price:.3f} стейк ${stake:.2f} — {signal.reason}",
                         )
+                        self._record_checkpoint_features(
+                            s_cfg, series_id, ctx, signal, "opened",
+                            fill_price=price, stake_usd=stake, trade_id=trade.id,
+                        )
                     else:
                         logger.warning("%s: could not afford stake $%.2f (balance $%.2f)", s_cfg.name, stake, wallet.balance)
                         self._log_activity(
                             s_cfg.name, series_id, window_min, "rejected",
                             f"не хватило средств на стейк ${stake:.2f} (баланс ${wallet.balance:.2f})",
+                        )
+                        self._record_checkpoint_features(
+                            s_cfg, series_id, ctx, signal, "rejected_insufficient_funds",
+                            fill_price=price, stake_usd=stake,
                         )
 
     # -- settling trades --------------------------------------------------------------

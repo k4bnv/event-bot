@@ -653,6 +653,121 @@ class PreviousOutcomeTrackingTests(unittest.IsolatedAsyncioTestCase):
             engine.storage.close()
 
 
+class CheckpointFeatureLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """Covers Engine._record_checkpoint_features — every decision path in
+    _open_due_trades (no_signal, each rejection reason, opened) must log a
+    row, since a dataset for future ML work needs the negative examples
+    too, not just executed trades. See storage.py's module docstring."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    async def test_no_signal_logs_a_feature_row(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+            engine.strategy_instances["breakout_retest"].evaluate = lambda ctx: _resolved(None)
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["decision"], "no_signal")
+            self.assertIsNone(rows[0]["signal_direction"])
+            self.assertIsNone(rows[0]["trade_id"])
+            engine.storage.close()
+
+    async def test_rejected_by_max_coefficient_logs_a_feature_row_with_fill_price(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            s_cfg = next(s for s in engine.cfg.strategies if s.name == "breakout_retest")
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.9, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+            engine.strategy_instances["breakout_retest"].evaluate = (
+                lambda ctx: _resolved(Signal(direction=Direction.UP, reason="test"))
+            )
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["decision"], "rejected_max_coefficient")
+            self.assertEqual(rows[0]["signal_direction"], "up")
+            self.assertAlmostEqual(rows[0]["fill_price"], 0.9)
+            self.assertLess(s_cfg.max_coefficient, 0.9)  # sanity: this really is why it was rejected
+            engine.storage.close()
+
+    async def test_opened_trade_logs_a_feature_row_linked_to_the_trade(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+            engine.strategy_instances["breakout_retest"].evaluate = (
+                lambda ctx: _resolved(Signal(direction=Direction.UP, reason="test"))
+            )
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            trade = engine.wallets["breakout_retest"].trades[0]
+            rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["decision"], "opened")
+            self.assertEqual(rows[0]["trade_id"], trade.id)
+            self.assertEqual(rows[0]["signal_direction"], "up")
+            self.assertAlmostEqual(rows[0]["stake_usd"], trade.stake_usd)
+            engine.storage.close()
+
+    async def test_a_logging_failure_never_blocks_the_real_trade(self):
+        # storage.log_checkpoint_features raising must not stop
+        # wallet.open_trade from actually happening — this is pure
+        # instrumentation, never load-bearing for trading logic.
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+            engine.strategy_instances["breakout_retest"].evaluate = (
+                lambda ctx: _resolved(Signal(direction=Direction.UP, reason="test"))
+            )
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+            engine.storage.log_checkpoint_features = lambda row: (_ for _ in ()).throw(RuntimeError("boom"))
+
+            await engine._open_due_trades()  # must not raise
+
+            self.assertEqual(len(engine.wallets["breakout_retest"].trades), 1)
+            engine.storage.close()
+
+
 def _resolved(value):
     async def _inner():
         return value

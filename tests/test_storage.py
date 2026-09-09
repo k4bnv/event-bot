@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.models import Direction, Trade
-from src.storage import Storage
+from src.storage import FEATURE_FIELDS, Storage
 from src.wallet import VirtualWallet
 
 
@@ -157,6 +157,84 @@ class StorageResetTests(unittest.TestCase):
 
             empty = storage.trades_stats(strategy="nonexistent")
             self.assertEqual(empty, {"total": 0, "wins": 0, "losses": 0, "winrate_pct": 0.0, "net_pnl": 0})
+            storage.close()
+
+
+def make_feature_row(id_="f1", strategy="a", ts=1000.0, decision="no_signal", **overrides) -> dict:
+    row = {f: None for f in FEATURE_FIELDS}
+    row.update({"id": id_, "strategy": strategy, "ts": ts, "decision": decision})
+    row.update(overrides)
+    return row
+
+
+class CheckpointFeaturesTests(unittest.TestCase):
+    """Covers the ML feature-logging table added for training on past
+    outcomes — see storage.py's module docstring and engine.py's
+    _record_checkpoint_features for what/why."""
+
+    def test_log_and_read_back(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(strategy="a", up_price=0.42, decision="opened"))
+
+            rows = storage.get_checkpoint_features()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["strategy"], "a")
+            self.assertEqual(rows[0]["up_price"], 0.42)
+            self.assertEqual(rows[0]["decision"], "opened")
+            storage.close()
+
+    def test_log_is_idempotent_on_duplicate_id(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="dup"))
+            storage.log_checkpoint_features(make_feature_row(id_="dup"))  # same id again
+            self.assertEqual(storage.count_checkpoint_features(), 1)
+            storage.close()
+
+    def test_filters_by_strategy_and_counts(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="1", strategy="a"))
+            storage.log_checkpoint_features(make_feature_row(id_="2", strategy="a"))
+            storage.log_checkpoint_features(make_feature_row(id_="3", strategy="b"))
+
+            self.assertEqual(len(storage.get_checkpoint_features(strategy="a")), 2)
+            self.assertEqual(len(storage.get_checkpoint_features(strategy="b")), 1)
+            self.assertEqual(storage.count_checkpoint_features(strategy="a"), 2)
+            self.assertEqual(storage.count_checkpoint_features(), 3)
+            storage.close()
+
+    def test_newest_first_by_default(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="old", ts=1000.0))
+            storage.log_checkpoint_features(make_feature_row(id_="new", ts=2000.0))
+            rows = storage.get_checkpoint_features()
+            self.assertEqual([r["id"] for r in rows], ["new", "old"])
+            storage.close()
+
+    def test_reset_does_not_wipe_checkpoint_features(self):
+        # Deliberate: this table is a market-conditions log for future ML
+        # work, not trading state — a config-tuning Reset shouldn't erase
+        # months of accumulated feature history along with the wallets.
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(strategy="a"))
+
+            storage.reset()
+
+            self.assertEqual(storage.count_checkpoint_features(), 1)
+            storage.close()
+
+    def test_reset_strategy_does_not_wipe_checkpoint_features(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(strategy="a"))
+
+            storage.reset_strategy("a")
+
+            self.assertEqual(storage.count_checkpoint_features(strategy="a"), 1)
             storage.close()
 
 

@@ -12,6 +12,17 @@ key (`id`) doing an INSERT OR IGNORE, no in-memory "already logged" set
 needed. `data/bot.db` can be inspected with any SQLite tool, e.g.:
     sqlite3 data/bot.db "SELECT * FROM trades ORDER BY closed_ts DESC LIMIT 20;"
     sqlite3 -header -csv data/bot.db "SELECT * FROM trades;" > trades.csv
+
+`checkpoint_features` is the same idea for a future ML pass over this
+bot's own history: one row per (strategy, entry checkpoint) EVALUATION —
+not just the ones that opened a trade. See engine.py's
+`_record_checkpoint_features` for what gets captured and why a row is
+written on every outcome (no_signal/rejected/opened alike): a dataset
+that only contains executed trades has no negative examples to learn
+"why not" from. `trade_id` links a row to its trades-table entry (and
+that row's eventual pnl_usd/status) when a trade actually opened; NULL
+when the checkpoint didn't result in one. Same export pattern as trades:
+    sqlite3 -header -csv data/bot.db "SELECT * FROM checkpoint_features;" > features.csv
 """
 from __future__ import annotations
 
@@ -76,7 +87,54 @@ CREATE TABLE IF NOT EXISTS wallets (
     reserved REAL,
     updated_at REAL
 );
+
+CREATE TABLE IF NOT EXISTS checkpoint_features (
+    id TEXT PRIMARY KEY,
+    ts REAL,
+    strategy TEXT NOT NULL,
+    series_id TEXT,
+    inst_id TEXT,
+    window_min INTEGER,
+    remaining_sec REAL,
+    market_method TEXT,
+    up_price REAL,
+    floor_strike REAL,
+    strike_is_fixed INTEGER,
+    spot REAL,
+    drift_5m_pct REAL,
+    mom_1m_pct REAL,
+    z_score REAL,
+    base_prob REAL,
+    sigma_horizon_pct REAL,
+    orderbook_bid_vol REAL,
+    orderbook_ask_vol REAL,
+    funding_rate REAL,
+    previous_outcome TEXT,
+    signal_direction TEXT,
+    signal_confidence REAL,
+    signal_reason TEXT,
+    decision TEXT NOT NULL,
+    fill_price REAL,
+    stake_usd REAL,
+    trade_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_features_strategy ON checkpoint_features(strategy);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_features_ts ON checkpoint_features(ts);
+CREATE INDEX IF NOT EXISTS idx_checkpoint_features_trade_id ON checkpoint_features(trade_id);
 """
+
+FEATURE_FIELDS = [
+    "id", "ts", "strategy", "series_id", "inst_id", "window_min", "remaining_sec",
+    "market_method", "up_price", "floor_strike", "strike_is_fixed", "spot",
+    "drift_5m_pct", "mom_1m_pct", "z_score", "base_prob", "sigma_horizon_pct",
+    "orderbook_bid_vol", "orderbook_ask_vol", "funding_rate", "previous_outcome",
+    "signal_direction", "signal_confidence", "signal_reason", "decision",
+    "fill_price", "stake_usd", "trade_id",
+]
+
+FEATURE_SORTABLE_COLUMNS = {
+    "ts", "strategy", "series_id", "window_min", "remaining_sec", "decision", "trade_id",
+}
 
 
 class Storage:
@@ -143,24 +201,80 @@ class Storage:
             for row in cur.fetchall()
         }
 
+    def log_checkpoint_features(self, row: dict) -> None:
+        """One feature snapshot row — see this module's docstring and
+        engine.py's `_record_checkpoint_features` for what it captures and
+        why. `row` must carry every key in FEATURE_FIELDS (None for
+        whichever don't apply this call) since this does a straight
+        positional INSERT; INSERT OR IGNORE makes a duplicate `id` a
+        silent no-op, same dedup approach as append_closed_trades."""
+        values = tuple(row.get(f) for f in FEATURE_FIELDS)
+        placeholders = ",".join("?" * len(FEATURE_FIELDS))
+        self._conn.execute(
+            f"INSERT OR IGNORE INTO checkpoint_features ({','.join(FEATURE_FIELDS)}) VALUES ({placeholders})",
+            values,
+        )
+        self._conn.commit()
+
+    def get_checkpoint_features(
+        self, strategy: Optional[str] = None, limit: Optional[int] = 200, offset: int = 0,
+        sort_by: str = "ts", sort_dir: str = "desc",
+    ) -> list[dict]:
+        """Feature rows, optionally filtered to one strategy, newest
+        first by default. `limit=None` returns every matching row (for a
+        full export, e.g. before training something offline) — pass an
+        int for a UI/inspection page."""
+        col = sort_by if sort_by in FEATURE_SORTABLE_COLUMNS else "ts"
+        direction = "ASC" if str(sort_dir).lower() == "asc" else "DESC"
+
+        where = ""
+        params: list = []
+        if strategy:
+            where = "WHERE strategy = ?"
+            params.append(strategy)
+
+        query = f"SELECT * FROM checkpoint_features {where} ORDER BY {col} {direction}, id {direction}"
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params += [limit, offset]
+
+        cur = self._conn.execute(query, params)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def count_checkpoint_features(self, strategy: Optional[str] = None) -> int:
+        if strategy:
+            cur = self._conn.execute("SELECT COUNT(*) FROM checkpoint_features WHERE strategy = ?", (strategy,))
+        else:
+            cur = self._conn.execute("SELECT COUNT(*) FROM checkpoint_features")
+        return cur.fetchone()[0]
+
     # -- reset -------------------------------------------------------------------
     def reset(self) -> None:
         """Wipe ALL persisted history for every strategy. Used by the
         dashboard's Reset DB button / `run.py --reset-data`. Does not
-        touch bot.log (kept as an audit trail of the reset itself)."""
+        touch bot.log (kept as an audit trail of the reset itself), and
+        deliberately does not touch checkpoint_features either: those
+        rows are a market-conditions log for future ML work, not trading
+        state — wiping them every time someone resets balances while
+        tuning a config would defeat the entire point of accumulating
+        them. A dangling trade_id after a reset just means that
+        particular row's eventual outcome link is gone; the feature
+        snapshot itself is still valid history."""
         self._conn.execute("DELETE FROM trades")
         self._conn.execute("DELETE FROM wallets")
         self._conn.commit()
-        logger.warning("Storage reset: all trades/wallets wiped from %s.", self.db_path)
+        logger.warning("Storage reset: all trades/wallets wiped from %s (checkpoint_features kept).", self.db_path)
 
     def reset_strategy(self, strategy: str) -> None:
         """Wipe persisted history for ONE strategy only — the others'
         rows are untouched. Used by the Settings tab's per-strategy Reset
-        button."""
+        button. Also leaves checkpoint_features alone — see reset()'s
+        docstring for why."""
         self._conn.execute("DELETE FROM trades WHERE strategy = ?", (strategy,))
         self._conn.execute("DELETE FROM wallets WHERE strategy = ?", (strategy,))
         self._conn.commit()
-        logger.warning("Storage reset for strategy '%s' only.", strategy)
+        logger.warning("Storage reset for strategy '%s' only (checkpoint_features kept).", strategy)
 
     # -- reads (dashboard analytics) ------------------------------------------------
     def get_trades(
