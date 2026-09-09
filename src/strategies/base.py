@@ -10,10 +10,11 @@ don't `await` anything.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Deque, Optional
 
-from ..models import Direction, EventMarket, OrderBookSnapshot, PricePoint
+from ..models import Direction, EventMarket, OrderBookSnapshot, PricePoint, TradePrint
 
 
 @dataclass
@@ -35,6 +36,17 @@ class StrategyContext:
     window_min: int                       # which configured entry checkpoint fired
     market: EventMarket                    # the event contract itself (px, strike, method, ...)
     funding_rate: Optional[float] = None   # current BTC perp funding rate, if available
+    # Recent executed trades on the underlying, aggressor side included —
+    # see models.TradePrint and market_data.py's btc_trade_prints(). Only
+    # absorption_reversal reads this today; every other strategy ignores
+    # it, same as they already ignore funding_rate/previous_outcome when
+    # not relevant to them.
+    trade_prints: Deque[TradePrint] = field(default_factory=deque)
+    # A short rolling history of orderbook snapshots (see
+    # market_data.py's btc_orderbook_history()) — `orderbook` above is
+    # always just the LATEST one; this is for "did the book just
+    # replenish" checks that need to compare against a bit further back.
+    orderbook_history: Deque[OrderBookSnapshot] = field(default_factory=deque)
     # The winning Direction of the window immediately BEFORE this series'
     # current one, if known — Engine._update_previous_outcomes() looks
     # this up the moment a window rolls over, independent of whether any

@@ -28,6 +28,24 @@ class PricePoint:
 
 
 @dataclass
+class TradePrint:
+    """One executed trade on the underlying (e.g. BTC-USDT spot), from
+    OKX's public trade-tape endpoint (GET /market/trades) — NOT the same
+    thing as OrderBookSnapshot's resting bid/ask levels. `side` is the
+    AGGRESSOR's (taker's) side straight from OKX's own `side` field: "buy"
+    means a market buy hit the ask (bullish pressure), "sell" means a
+    market sell hit the bid (bearish pressure). This is what a real
+    trade-flow-imbalance (TFI) signal needs — a resting order in the book
+    can be pulled before it ever trades; an executed print is a fact that
+    already happened. See absorption_reversal.py, the first strategy that
+    uses this."""
+    ts: float
+    price: float
+    size: float
+    side: str  # "buy" | "sell"
+
+
+@dataclass
 class OrderBookLevel:
     price: float
     size: float

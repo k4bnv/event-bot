@@ -26,18 +26,33 @@ from abc import ABC, abstractmethod
 from collections import deque
 from typing import Deque, Optional
 
-from .models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, PricePoint
+from .models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, PricePoint, TradePrint
 from .okx_client import OKXClient, OKXAPIError, OKXNetworkError
 
 logger = logging.getLogger("okx_event_bot.market_data")
 
 PRICE_HISTORY_MAXLEN = 1200  # ~1hr at 3s polling
+# Trade prints arrive in bursts (several per poll during active periods) —
+# sized generously so a strategy computing a volume BASELINE over several
+# minutes (see absorption_reversal.py) doesn't run out of history before
+# its lookback window does.
+TRADE_PRINTS_MAXLEN = 5000
+# Short — this only needs to cover a "did the book just replenish"
+# confirmation check over the last ~30-60s, not a long history.
+ORDERBOOK_HISTORY_MAXLEN = 60
 
 
 class MarketDataProvider(ABC):
     def __init__(self) -> None:
         self._price_history: Deque[PricePoint] = deque(maxlen=PRICE_HISTORY_MAXLEN)
         self._orderbook: Optional[OrderBookSnapshot] = None
+        # A short rolling history of orderbook snapshots — separate from
+        # `_orderbook` (always just the latest one, used everywhere else)
+        # because "did bid depth recover after being hit" needs to compare
+        # against a few-tens-of-seconds-ago snapshot, not just the current
+        # one. Always kept in sync with `_orderbook` via _record_orderbook().
+        self._orderbook_history: Deque[OrderBookSnapshot] = deque(maxlen=ORDERBOOK_HISTORY_MAXLEN)
+        self._trade_prints: Deque[TradePrint] = deque(maxlen=TRADE_PRINTS_MAXLEN)
         self._active_markets: dict[str, EventMarket] = {}
         self._funding_rate: Optional[float] = None  # BTC perp funding rate, e.g. 0.0001 = 0.01%
 
@@ -50,11 +65,29 @@ class MarketDataProvider(ABC):
         """Return the Direction that won (UP or DOWN) once this instId has
         settled, else None (caller should retry)."""
 
+    def _record_orderbook(self, book: OrderBookSnapshot) -> None:
+        """The ONE place both providers set a fresh orderbook snapshot —
+        keeps `_orderbook` (latest) and `_orderbook_history` (rolling
+        window) from ever drifting out of sync with each other."""
+        self._orderbook = book
+        self._orderbook_history.append(book)
+
     def btc_price_history(self) -> Deque[PricePoint]:
         return self._price_history
 
     def btc_orderbook(self) -> Optional[OrderBookSnapshot]:
         return self._orderbook
+
+    def btc_orderbook_history(self) -> Deque[OrderBookSnapshot]:
+        return self._orderbook_history
+
+    def btc_trade_prints(self) -> Deque[TradePrint]:
+        """Recent executed trades on the underlying, aggressor side
+        included — see models.TradePrint. Empty until at least one
+        refresh() has run; a strategy reading this should treat "not
+        enough history yet" the same way it treats "not enough price
+        history yet" (return None, don't guess)."""
+        return self._trade_prints
 
     def active_markets(self) -> dict[str, EventMarket]:
         return self._active_markets
@@ -89,9 +122,15 @@ class OkxMarketDataProvider(MarketDataProvider):
         self.funding_refresh_interval_sec = funding_refresh_interval_sec
         self._series_method: dict[str, str] = {}  # series_id -> settlement.method, cached
         self._last_funding_fetch_ts = 0.0
+        # Dedup for get_trades() polling — OKX returns the most recent N
+        # trades newest-first every call, heavily overlapping the previous
+        # poll's response. Tracks the newest tradeId already appended to
+        # `_trade_prints`, so only genuinely new prints get added.
+        self._last_trade_id: Optional[str] = None
 
     async def refresh(self) -> None:
         await self._refresh_underlying()
+        await self._refresh_trade_prints()
         await self._maybe_refresh_funding()
         for series_id in self.series_ids:
             try:
@@ -125,9 +164,45 @@ class OkxMarketDataProvider(MarketDataProvider):
                 raw = book[0]
                 bids = [OrderBookLevel(price=float(p), size=float(s)) for p, s, *_ in raw.get("bids", [])]
                 asks = [OrderBookLevel(price=float(p), size=float(s)) for p, s, *_ in raw.get("asks", [])]
-                self._orderbook = OrderBookSnapshot(ts=time.time(), bids=bids, asks=asks)
+                self._record_orderbook(OrderBookSnapshot(ts=time.time(), bids=bids, asks=asks))
         except (OKXAPIError, OKXNetworkError) as exc:
             logger.error("Failed refreshing underlying %s: %s", self.underlying_inst_id, exc)
+
+    async def _refresh_trade_prints(self) -> None:
+        """Appends only trades newer than the last poll's newest tradeId
+        (see _last_trade_id) — OKX's response overlaps heavily between
+        consecutive polls. A failure here is logged and skipped, same as
+        every other best-effort market-data fetch: a strategy reading
+        btc_trade_prints() already has to treat "not enough data yet" as
+        a normal case, not a fatal one."""
+        try:
+            rows = await self.client.get_trades(self.underlying_inst_id, limit=100)
+        except (OKXAPIError, OKXNetworkError) as exc:
+            logger.warning("Failed refreshing trade prints for %s: %s", self.underlying_inst_id, exc)
+            return
+        if not rows:
+            return
+
+        # `rows` is newest-first; collect everything up to (not including)
+        # the last tradeId we already have, then append oldest-first so
+        # _trade_prints stays chronological like _price_history.
+        new_rows = []
+        for row in rows:
+            if row.get("tradeId") == self._last_trade_id:
+                break
+            new_rows.append(row)
+        if not new_rows:
+            return
+        self._last_trade_id = rows[0].get("tradeId")
+
+        for row in reversed(new_rows):
+            try:
+                self._trade_prints.append(TradePrint(
+                    ts=_to_epoch_sec(row.get("ts")) or time.time(),
+                    price=float(row["px"]), size=float(row["sz"]), side=str(row.get("side", "")),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue  # one malformed row shouldn't drop the rest
 
     async def _series_settlement_method(self, series_id: str) -> Optional[str]:
         if series_id in self._series_method:

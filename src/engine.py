@@ -622,6 +622,8 @@ class Engine:
                         market=market, funding_rate=self.provider.funding_rate(),
                         previous_outcome=self._previous_outcome.get(series_id),
                         already_open_this_market=already_open_this_market,
+                        trade_prints=self.provider.btc_trade_prints(),
+                        orderbook_history=self.provider.btc_orderbook_history(),
                     )
                     signal = await strategy.evaluate(ctx)
                     if signal is None:

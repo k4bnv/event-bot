@@ -22,7 +22,7 @@ import time
 from typing import Optional
 
 from .market_data import MarketDataProvider
-from .models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, PricePoint
+from .models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, PricePoint, TradePrint
 
 
 def _series_duration_sec(series_id: str) -> float:
@@ -44,6 +44,13 @@ class MockMarketDataProvider(MarketDataProvider):
         self._settlement_truth: dict[str, Direction] = {}        # inst_id -> winning Direction
         self._tick = 0
         self._funding_rate = 0.0    # synthetic BTC perp funding rate, mean-reverting around 0
+        # Occasionally-injected synthetic "absorption" episode — see
+        # _maybe_start_absorption/_step_trade_prints — so
+        # absorption_reversal has a genuine pattern to detect in mock/dev
+        # mode: heavy one-sided aggressor flow while price is deliberately
+        # damped, i.e. exactly the setup that strategy looks for. None
+        # when no episode is active.
+        self._absorption_state: Optional[dict] = None
         for sid in series_ids:
             self._roll_window(sid)
 
@@ -74,11 +81,19 @@ class MockMarketDataProvider(MarketDataProvider):
         self._roll_window(series_id)
 
     # -- price model -----------------------------------------------------------------
-    def _step_price(self) -> None:
+    def _step_price(self, damp: bool = False) -> None:
         sigma = 0.0006
+        if damp:
+            # An absorption episode is, by construction, pressure the
+            # price is (for now) RESISTING — heavily muted realized vol is
+            # exactly the "price barely moves despite heavy flow" setup
+            # absorption_reversal's Phase A looks for.
+            sigma *= 0.15
         drift = self._rng.gauss(0, sigma)
-        # ~1.5% chance per tick of an "impulse" move, gives breakout strategy signal
-        if self._rng.random() < 0.015:
+        # ~1.5% chance per tick of an "impulse" move, gives breakout strategy
+        # signal — suppressed during a damped tick, which would defeat the
+        # whole point of it.
+        if not damp and self._rng.random() < 0.015:
             drift += self._rng.choice([-1, 1]) * self._rng.uniform(0.004, 0.012)
         # Geometric (log-normal) step, NOT price *= (1 + drift): the naive
         # arithmetic version has a systematic downward "volatility drag" bias
@@ -88,6 +103,51 @@ class MockMarketDataProvider(MarketDataProvider):
         # (martingale) random walk no matter how long the bot runs.
         self.price *= math.exp(drift - (sigma ** 2) / 2)
         self._tick += 1
+
+    def _maybe_start_absorption(self) -> None:
+        """~1% chance per tick to start a new synthetic absorption episode
+        (skipped while one's already running) — lasts 15-30 ticks. Picks
+        which side dominates the aggressor flow for the whole episode;
+        _step_price's damping and _step_trade_prints'/refresh()'s book
+        skew all read this same state so price/flow/book all agree with
+        each other for the episode's duration, like a real absorption
+        setup would."""
+        if self._absorption_state is not None or self._rng.random() >= 0.01:
+            return
+        self._absorption_state = {
+            "dominant_side": self._rng.choice(["sell", "buy"]),
+            "ticks_left": self._rng.randint(15, 30),
+        }
+
+    def _step_trade_prints(self, price_before: float) -> None:
+        """Synthetic aggressor-classified trade prints for this tick — see
+        models.TradePrint. Normal case: aggressor mix loosely tracks
+        whichever way price just moved (a crude "trades caused the move"
+        baseline) plus noise. During an active absorption episode, flow is
+        deliberately heavier and far more one-sided than the (deliberately
+        damped) price move alone would suggest — that divergence IS the
+        pattern absorption_reversal looks for. Real OKX trade prints
+        (market_data.py's OkxMarketDataProvider) replace this entirely in
+        live mode; this only exists for mock/dev testing."""
+        now = time.time()
+        n_prints = self._rng.randint(3, 8)
+
+        if self._absorption_state is not None:
+            buy_prob = 0.15 if self._absorption_state["dominant_side"] == "sell" else 0.85
+            size_mult = 2.5
+            self._absorption_state["ticks_left"] -= 1
+            if self._absorption_state["ticks_left"] <= 0:
+                self._absorption_state = None
+        else:
+            price_delta_pct = (self.price - price_before) / price_before if price_before else 0.0
+            bias = max(-1.0, min(1.0, price_delta_pct * 300 + self._rng.gauss(0, 0.35)))
+            buy_prob = 0.5 + bias * 0.4
+            size_mult = 1.0
+
+        for _ in range(n_prints):
+            side = "buy" if self._rng.random() < buy_prob else "sell"
+            size = self._rng.uniform(0.01, 0.25) * size_mult
+            self._trade_prints.append(TradePrint(ts=now, price=self.price, size=size, side=side))
 
     def _step_funding(self) -> None:
         """Mean-reverting synthetic funding rate with occasional larger
@@ -108,18 +168,31 @@ class MockMarketDataProvider(MarketDataProvider):
 
     # -- MarketDataProvider interface ------------------------------------------------
     async def refresh(self) -> None:
-        self._step_price()
+        self._maybe_start_absorption()
+        absorbing = self._absorption_state is not None
+        price_before = self.price
+        self._step_price(damp=absorbing)
         self._step_funding()
         self._price_history.append(PricePoint(ts=time.time(), price=self.price))
 
         # synthetic order book around current price, with a random imbalance
         # occasionally injected so the orderbook-momentum strategy has signal.
-        skew = self._rng.uniform(-1, 1) if self._rng.random() < 0.2 else 0.0
+        if absorbing:
+            # Heavy selling absorption -> resting bid stays thick
+            # (replenished, not thinning) despite the aggressive flow
+            # hitting it — mirror for a buying episode.
+            skew = (0.5 if self._absorption_state["dominant_side"] == "sell" else -0.5) * self._rng.uniform(0.6, 1.6)
+        else:
+            skew = self._rng.uniform(-1, 1) if self._rng.random() < 0.2 else 0.0
         bids, asks = [], []
         for i in range(1, 11):
             bids.append(OrderBookLevel(price=self.price * (1 - 0.0002 * i), size=max(0.05, 1.0 + skew) * self._rng.uniform(0.5, 1.5)))
             asks.append(OrderBookLevel(price=self.price * (1 + 0.0002 * i), size=max(0.05, 1.0 - skew) * self._rng.uniform(0.5, 1.5)))
-        self._orderbook = OrderBookSnapshot(ts=time.time(), bids=bids, asks=asks)
+        self._record_orderbook(OrderBookSnapshot(ts=time.time(), bids=bids, asks=asks))
+
+        # _step_trade_prints may clear self._absorption_state once its
+        # ticks_left counts down — must run AFTER the skew above reads it.
+        self._step_trade_prints(price_before)
 
         now = time.time()
         for series_id in self.series_ids:

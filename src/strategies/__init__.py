@@ -1,3 +1,4 @@
+from .absorption_reversal import AbsorptionReversalStrategy
 from .adaptive_timing import AdaptiveTimingStrategy
 from .ai_prompt import AIPromptStrategy
 from .base import BaseStrategy, Signal, StrategyContext
@@ -21,6 +22,7 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "favorite_bias": FavoriteBiasStrategy,
     "prior_window_momentum": PriorWindowMomentumStrategy,
     "adaptive_timing": AdaptiveTimingStrategy,
+    "absorption_reversal": AbsorptionReversalStrategy,
 }
 
 __all__ = [
@@ -37,5 +39,6 @@ __all__ = [
     "FavoriteBiasStrategy",
     "PriorWindowMomentumStrategy",
     "AdaptiveTimingStrategy",
+    "AbsorptionReversalStrategy",
     "STRATEGY_REGISTRY",
 ]

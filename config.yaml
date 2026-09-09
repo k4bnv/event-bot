@@ -303,6 +303,39 @@ strategies:
     lookback_sec: 120
     min_edge: 0.08
 
+  # "Failed attack -> reversal": heavy real aggressor selling (from the
+  # underlying's actual executed trade tape, not resting book orders —
+  # see src/models.py's TradePrint) while price barely falls means
+  # someone is absorbing the selling; once that pressure fades, the odds
+  # of an UP move rise (mirror for heavy buying -> DOWN). Rule-based, not
+  # the ML/CatBoost model the original idea described — see
+  # src/strategies/absorption_reversal.py's module docstring for exactly
+  # what's built vs what's aspirational. dynamic_timing: true for the
+  # same reason as J: it scans continuously and places at most one trade
+  # per market, whenever all three phases (pressure+absorption residual,
+  # book confirmation, breakout trigger) line up — not a bet at every
+  # checkpoint.
+  absorption_reversal:
+    enabled: true
+    display_name: "K: Absorption Reversal"
+    deposit_usd: 100
+    dynamic_timing: true
+    entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
+    max_coefficient: 0.6
+    stake_fraction: 0.01
+    tfi_lookback_sec: 90        # Phase A: window for the Trade-Flow-Imbalance calc (60-120s per the original write-up)
+    min_abs_tfi: 0.5            # |TFI| must be at least this extreme to even consider a candidate
+    min_prints: 8               # minimum executed trades in tfi_lookback_sec — too few is noise, not real pressure
+    baseline_lookback_sec: 600  # 10 min — the volume/vol "normal" baseline Phase A's elevated-volume check compares against
+    min_volume_multiple: 1.5    # current window's trade rate must be at least this many times the baseline rate
+    residual_sensitivity: 1.0   # how many realized-vol sigmas of "expected move" one full unit of TFI implies
+    min_residual_pct: 0.03      # minimum actual-vs-expected divergence (in %) to call it absorption, not noise
+    confirm_lookback_sec: 30    # Phase B: how far back to check the attacked book side hasn't drained
+    min_replenish_ratio: 0.7    # that side's current depth must be at least this fraction of what it was back then
+    book_depth_levels: 10
+    trigger_lookback_sec: 30    # Phase C: local range price must break out of to actually trigger entry
+    max_spread_pct: 0.15        # reject outright if the underlying's own spread is this wide (%) — data too thin to trust
+
 # --- Dashboard -----------------------------------------------------------------
 dashboard:
   mode: web                 # console | web | both | none

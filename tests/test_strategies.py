@@ -1,5 +1,6 @@
 import math
 import os
+import random
 import sys
 import time
 import unittest
@@ -8,7 +9,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.llm_client import ChatAPIError
-from src.models import Direction, EventMarket, PricePoint
+from src.models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, PricePoint, TradePrint
+from src.strategies.absorption_reversal import (
+    AbsorptionReversalStrategy, book_side_replenished, breaks_local_range, compute_tfi,
+    expected_return_pct, realized_vol_pct_per_sqrt_sec,
+)
 from src.strategies.adaptive_timing import AdaptiveTimingStrategy
 from src.strategies.ai_prompt import (
     BARRIER_PROMPT_TEMPLATE, AIPromptStrategy, build_client_config, _guess_symbol, _pct_change_over,
@@ -208,6 +213,197 @@ class AdaptiveTimingStrategyTests(unittest.IsolatedAsyncioTestCase):
 
         ctx_committed = make_ctx(points, remaining_sec=90, market=market, already_open_this_market=True)
         self.assertIsNone(await strategy.evaluate(ctx_committed))
+
+
+class AbsorptionReversalMathTests(unittest.TestCase):
+    def test_compute_tfi_all_buy_is_plus_one(self):
+        prints = [TradePrint(ts=0, price=100, size=1.0, side="buy") for _ in range(5)]
+        self.assertEqual(compute_tfi(prints), 1.0)
+
+    def test_compute_tfi_all_sell_is_minus_one(self):
+        prints = [TradePrint(ts=0, price=100, size=1.0, side="sell") for _ in range(5)]
+        self.assertEqual(compute_tfi(prints), -1.0)
+
+    def test_compute_tfi_balanced_is_zero(self):
+        prints = [TradePrint(ts=0, price=100, size=1.0, side=s) for s in ("buy", "sell")]
+        self.assertEqual(compute_tfi(prints), 0.0)
+
+    def test_compute_tfi_none_with_no_volume(self):
+        self.assertIsNone(compute_tfi([]))
+        self.assertIsNone(compute_tfi([TradePrint(ts=0, price=100, size=0.0, side="buy")]))
+
+    def test_realized_vol_none_with_insufficient_points(self):
+        points = make_points([100] * 5)
+        self.assertIsNone(realized_vol_pct_per_sqrt_sec(points))
+
+    def test_realized_vol_none_with_zero_variance(self):
+        points = make_points([100.0] * 20)  # perfectly flat -> zero realized vol, no floor here
+        self.assertIsNone(realized_vol_pct_per_sqrt_sec(points))
+
+    def test_realized_vol_positive_with_real_fluctuation(self):
+        points = make_points([100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)])
+        vol = realized_vol_pct_per_sqrt_sec(points)
+        self.assertIsNotNone(vol)
+        self.assertGreater(vol, 0)
+
+    def test_expected_return_pct_sign_follows_tfi(self):
+        self.assertGreater(expected_return_pct(tfi=0.5, vol_pct_per_sqrt_sec=1.0, horizon_sec=100, sensitivity=1.0), 0)
+        self.assertLess(expected_return_pct(tfi=-0.5, vol_pct_per_sqrt_sec=1.0, horizon_sec=100, sensitivity=1.0), 0)
+        self.assertEqual(expected_return_pct(tfi=0.0, vol_pct_per_sqrt_sec=1.0, horizon_sec=100, sensitivity=1.0), 0.0)
+
+    def test_book_side_replenished_true_when_depth_held_up(self):
+        past = OrderBookSnapshot(ts=0, bids=[OrderBookLevel(price=100, size=5.0)], asks=[])
+        current = OrderBookSnapshot(ts=30, bids=[OrderBookLevel(price=100, size=4.0)], asks=[])
+        self.assertTrue(book_side_replenished([past, current], now=30, lookback_sec=60, depth=10, side="bid", min_ratio=0.7))
+
+    def test_book_side_replenished_false_when_draining(self):
+        past = OrderBookSnapshot(ts=0, bids=[OrderBookLevel(price=100, size=5.0)], asks=[])
+        current = OrderBookSnapshot(ts=30, bids=[OrderBookLevel(price=100, size=1.0)], asks=[])
+        self.assertFalse(book_side_replenished([past, current], now=30, lookback_sec=60, depth=10, side="bid", min_ratio=0.7))
+
+    def test_book_side_replenished_false_with_too_little_history(self):
+        current = OrderBookSnapshot(ts=30, bids=[OrderBookLevel(price=100, size=5.0)], asks=[])
+        self.assertFalse(book_side_replenished([current], now=30, lookback_sec=60, depth=10, side="bid", min_ratio=0.7))
+
+    def test_breaks_local_range_up(self):
+        points = make_points([100, 101, 99, 100, 102])
+        self.assertTrue(breaks_local_range(points, Direction.UP))
+        self.assertFalse(breaks_local_range(points, Direction.DOWN))
+
+    def test_breaks_local_range_false_with_too_few_points(self):
+        self.assertFalse(breaks_local_range(make_points([100, 101]), Direction.UP))
+
+
+def make_absorption_scenario(dominant_side: str, seed: int = 7, breakout: bool = True):
+    """A synthetic scenario built to satisfy every phase of
+    AbsorptionReversalStrategy at once, with default config — verified
+    numerically (see the PR/commit this landed in) rather than guessed.
+    dominant_side="sell": heavy aggressor selling, price barely falls (an
+    absorption of sell pressure) -> UP candidate. dominant_side="buy" is
+    the exact mirror -> DOWN candidate. breakout=False keeps phases A/B
+    intact but never lets price actually break the recent range, so
+    Phase C alone is what's being tested to fail."""
+    rng = random.Random(seed)
+    now = 1_000_000.0
+    sign = -1 if dominant_side == "sell" else 1
+
+    price_history = []
+    base = 60000.0
+    t, p = now - 700, base
+    while t < now - 90:
+        p *= (1 + rng.gauss(0, 0.00015))
+        price_history.append(PricePoint(ts=t, price=p))
+        t += 3.0
+    while t < now - 3:
+        # A tiny persistent move AGAINST what the dominant aggressor side
+        # implies — heavy selling (sign=-1) still nudges price up a hair,
+        # heavy buying nudges it down a hair. That divergence from the
+        # TFI-implied direction is the absorption signature Phase A looks for.
+        p *= (1 + sign * 0.00002)
+        price_history.append(PricePoint(ts=t, price=p))
+        t += 3.0
+    if breakout:
+        recent = [pt.price for pt in price_history[-10:]]
+        p = (max(recent) * 1.0005) if dominant_side == "sell" else (min(recent) * 0.9995)
+    price_history.append(PricePoint(ts=now, price=p))
+
+    prints = []
+    tp = now - 90
+    while tp < now:
+        side = dominant_side if rng.random() < 0.85 else ("buy" if dominant_side == "sell" else "sell")
+        prints.append(TradePrint(ts=tp, price=p, size=rng.uniform(0.05, 0.2), side=side))
+        tp += 2.0
+    tp = now - 600
+    while tp < now - 90:
+        prints.append(TradePrint(ts=tp, price=base, size=rng.uniform(0.01, 0.05), side=rng.choice(["buy", "sell"])))
+        tp += 15.0
+    prints.sort(key=lambda x: x.ts)
+
+    # The side under "attack" (bid for a sell-dominant/UP setup, ask for a
+    # buy-dominant/DOWN one) stays replenished — current depth ~90% of
+    # 30s-ago, comfortably above the default min_replenish_ratio (0.7).
+    confirm_side = "bid" if dominant_side == "sell" else "ask"
+    if confirm_side == "bid":
+        book_old = OrderBookSnapshot(ts=now - 30, bids=[OrderBookLevel(price=p * 0.999, size=5.0)], asks=[OrderBookLevel(price=p * 1.001, size=5.0)])
+        book_new = OrderBookSnapshot(ts=now, bids=[OrderBookLevel(price=p * 0.9995, size=4.5)], asks=[OrderBookLevel(price=p * 1.0005, size=5.0)])
+    else:
+        book_old = OrderBookSnapshot(ts=now - 30, bids=[OrderBookLevel(price=p * 0.999, size=5.0)], asks=[OrderBookLevel(price=p * 1.001, size=5.0)])
+        book_new = OrderBookSnapshot(ts=now, bids=[OrderBookLevel(price=p * 0.9995, size=5.0)], asks=[OrderBookLevel(price=p * 1.0005, size=4.5)])
+
+    return price_history, prints, [book_old, book_new], book_new, now
+
+
+def make_absorption_ctx(dominant_side: str, **overrides):
+    price_history, prints, orderbook_history, book_new, now = make_absorption_scenario(
+        dominant_side, breakout=overrides.pop("breakout", True),
+    )
+    market = make_market(up_price=0.5, floor_strike=60000.0, expiry_ts=now + 300)
+    defaults = dict(
+        price_history=price_history, orderbook=book_new, remaining_sec=300, window_min=5,
+        market=market, trade_prints=prints, orderbook_history=orderbook_history,
+    )
+    defaults.update(overrides)
+    return StrategyContext(**defaults)
+
+
+class AbsorptionReversalStrategyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_setup_signals_up_on_absorbed_selling(self):
+        strategy = AbsorptionReversalStrategy(config={})
+        signal = await strategy.evaluate(make_absorption_ctx("sell"))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+
+    async def test_full_setup_signals_down_on_absorbed_buying(self):
+        strategy = AbsorptionReversalStrategy(config={})
+        signal = await strategy.evaluate(make_absorption_ctx("buy"))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)
+
+    async def test_already_open_this_market_suppresses_a_signal_it_would_otherwise_take(self):
+        strategy = AbsorptionReversalStrategy(config={})
+        ctx = make_absorption_ctx("sell", already_open_this_market=True)
+        self.assertIsNone(await strategy.evaluate(ctx))
+
+    async def test_no_signal_before_the_breakout_trigger(self):
+        # Phases A and B are satisfied, but price hasn't actually broken
+        # the local range yet — Phase C must still hold the line.
+        strategy = AbsorptionReversalStrategy(config={})
+        ctx = make_absorption_ctx("sell", breakout=False)
+        self.assertIsNone(await strategy.evaluate(ctx))
+
+    async def test_no_signal_when_tfi_not_extreme_enough(self):
+        strategy = AbsorptionReversalStrategy(config={"min_abs_tfi": 0.99})  # real TFI here is ~0.74
+        self.assertIsNone(await strategy.evaluate(make_absorption_ctx("sell")))
+
+    async def test_no_signal_when_residual_too_small(self):
+        strategy = AbsorptionReversalStrategy(config={"min_residual_pct": 5.0})  # real residual here is ~0.07%
+        self.assertIsNone(await strategy.evaluate(make_absorption_ctx("sell")))
+
+    async def test_no_signal_when_volume_not_elevated_enough(self):
+        strategy = AbsorptionReversalStrategy(config={"min_volume_multiple": 1000.0})
+        self.assertIsNone(await strategy.evaluate(make_absorption_ctx("sell")))
+
+    async def test_no_signal_when_book_side_is_not_confirmed(self):
+        strategy = AbsorptionReversalStrategy(config={"min_replenish_ratio": 1.5})  # impossible to satisfy
+        self.assertIsNone(await strategy.evaluate(make_absorption_ctx("sell")))
+
+    async def test_no_signal_with_too_few_prints(self):
+        strategy = AbsorptionReversalStrategy(config={"min_prints": 10_000})
+        self.assertIsNone(await strategy.evaluate(make_absorption_ctx("sell")))
+
+    async def test_no_signal_without_orderbook_or_trade_prints(self):
+        strategy = AbsorptionReversalStrategy(config={})
+        ctx = make_absorption_ctx("sell")
+        ctx.orderbook = None
+        self.assertIsNone(await strategy.evaluate(ctx))
+
+        ctx2 = make_absorption_ctx("sell")
+        ctx2.trade_prints = []
+        self.assertIsNone(await strategy.evaluate(ctx2))
+
+    async def test_no_signal_when_spread_too_wide(self):
+        strategy = AbsorptionReversalStrategy(config={"max_spread_pct": 0.001})  # far stricter than the fixture's book
+        self.assertIsNone(await strategy.evaluate(make_absorption_ctx("sell")))
 
 
 class VolatilityBreakoutStrategyTests(unittest.IsolatedAsyncioTestCase):

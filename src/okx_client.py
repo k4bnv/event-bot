@@ -186,6 +186,17 @@ class OKXClient:
         """Index price (e.g. BTC-USDT) — public/unauthenticated."""
         return await self._request("GET", "/api/v5/market/index-tickers", {"instId": inst_id})
 
+    async def get_trades(self, inst_id: str, limit: int = 100) -> list[dict]:
+        """Most recent executed trades on `inst_id`, newest first — public/
+        unauthenticated, standard v5 market data (unlike the EVENTS
+        endpoints below). Response fields: instId, tradeId, px, sz,
+        side ("buy"/"sell" — the AGGRESSOR/taker's side), ts (ms epoch).
+        This is the ONLY endpoint that carries which side was the
+        aggressor — get_orderbook only shows resting orders, which can be
+        pulled before they ever trade. See models.TradePrint/
+        absorption_reversal.py."""
+        return await self._request("GET", "/api/v5/market/trades", {"instId": inst_id, "limit": limit})
+
     async def get_funding_rate(self, inst_id: str = "BTC-USDT-SWAP") -> list[dict]:
         """Current + predicted next funding rate for a perpetual swap —
         standard, stable, public/unauthenticated v5 endpoint (unlike the
