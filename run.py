@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import logging
 import sys
+import time
+from pathlib import Path
+from typing import Optional
 
 from src.config import load_config
 from src.engine import Engine
@@ -113,7 +117,176 @@ def _simulate_market_fill(levels: list, budget_usd: float):
     return vwap, contracts, spent, fully_filled
 
 
-async def check_liquidity(cfg, test_stake_usd: float = 20.0) -> None:
+async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stake_usd: float) -> Optional[dict]:
+    """One fetch+simulate pass for a single series' current live
+    instrument. Prints the human-readable detail (same as before) AND
+    returns a flat dict of the numeric fields worth aggregating across
+    repeated samples — None if this pass produced nothing usable (no live
+    market / empty ticker / empty book)."""
+
+    def _exp_ms(m: dict) -> float:
+        raw = m.get("expTime")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    try:
+        markets = await client.get_event_markets(series_id=series_id, state="live")
+    except Exception as exc:
+        print(f"{series_id}: failed to list live markets ({exc})")
+        return None
+    if not markets:
+        print(f"{series_id}: no live markets right now")
+        return None
+
+    chosen = min(markets, key=_exp_ms)  # nearest-expiry instrument, same pick the engine itself trades
+    inst_id = str(chosen.get("instId", "?"))
+    exp_ms = _exp_ms(chosen)
+    remaining_sec = (exp_ms / 1000.0 - time.time()) if exp_ms != float("inf") else None
+
+    try:
+        ticker = await client.get_ticker(inst_id)
+        book = await client.get_orderbook(inst_id, sz=20)
+    except Exception as exc:
+        print(f"{series_id} ({inst_id}): failed to fetch ticker/book ({exc})")
+        return None
+
+    remaining_note = f"  (~{remaining_sec:.0f}s to expiry)" if remaining_sec is not None else ""
+    print(f"\n{series_id}  ->  {inst_id}{remaining_note}")
+
+    last, spread_pct = None, None
+    if not ticker:
+        print("  ticker: <empty — no live quote>")
+    else:
+        row = ticker[0]
+        last, bid, ask = row.get("last"), row.get("bidPx"), row.get("askPx")
+        bid_sz, ask_sz = row.get("bidSz"), row.get("askSz")
+        print(f"  ticker: last={last}  bid={bid}({bid_sz})  ask={ask}({ask_sz})")
+        try:
+            bid_f, ask_f = float(bid), float(ask)
+            mid = (bid_f + ask_f) / 2
+            spread_abs = ask_f - bid_f
+            spread_pct = (spread_abs / mid * 100) if mid else None
+            print(f"  top-of-book spread: {spread_abs:.4f} absolute  ({spread_pct:.1f}% of mid {mid:.4f})")
+        except (TypeError, ValueError):
+            pass
+
+    if not book:
+        print("  book: <empty> — can't simulate a fill")
+        return None
+
+    b = book[0]
+    asks, bids = b.get("asks", []), b.get("bids", [])
+    print(f"  book depth: {len(bids)} bid levels / {len(asks)} ask levels")
+
+    # UP: walking real ask depth for a real BUY UP is a faithful
+    # simulation (you're buying exactly the instrument those asks quote).
+    up_vwap, up_contracts, up_spent, up_full = _simulate_market_fill(asks, test_stake_usd)
+    up_slippage_pct = None
+    print(f"  simulated ${test_stake_usd:.2f} market BUY UP:")
+    if up_vwap is None:
+        print("    <no ask liquidity at all>")
+    else:
+        print(f"    vwap_fill={up_vwap:.4f}  contracts={up_contracts:.2f}  "
+              f"spent=${up_spent:.2f}  {'(fully filled)' if up_full else '(BOOK RAN OUT — worse in reality)'}")
+        try:
+            engine_price = float(last) if last not in (None, "") else float(asks[0][0])
+            up_slippage_pct = (up_vwap - engine_price) / engine_price * 100
+            print(f"    vs engine's simulated entry ({engine_price:.4f}): {up_slippage_pct:+.1f}% slippage")
+        except (TypeError, ValueError, IndexError):
+            pass
+
+    # DOWN: bids are OTHER traders' resting buy-UP orders, not a depth of
+    # offers to sell you DOWN — walking multiple levels like we do for UP
+    # is not a faithful simulation (OKX doesn't publicly document how a
+    # DOWN/"no" order actually matches internally), and produces nonsense
+    # once the top level is thin. Report only the top-of-book estimate
+    # (1 - best_bid) as a best-case floor, explicitly NOT a depth simulation.
+    down_top_estimate, down_diff_pct = None, None
+    print("  DOWN top-of-book estimate (best case only — NOT a depth simulation, see docstring):")
+    if not bids:
+        print("    <no bid liquidity at all>")
+    else:
+        try:
+            best_bid = float(bids[0][0])
+            down_top_estimate = round(1 - best_bid, 4)
+            engine_price_down = round(1 - float(last), 4) if last not in (None, "") else down_top_estimate
+            if engine_price_down:
+                down_diff_pct = (down_top_estimate - engine_price_down) / engine_price_down * 100
+                print(f"    best case ~{down_top_estimate:.4f} (vs engine's {engine_price_down:.4f}: "
+                      f"{down_diff_pct:+.1f}%) — a real fill only gets WORSE (higher) than this the "
+                      f"deeper the order has to walk; how much worse isn't something the public book "
+                      f"tells us for this side.")
+            else:
+                print(f"    best case ~{down_top_estimate:.4f}")
+        except (TypeError, ValueError, IndexError, ZeroDivisionError):
+            pass
+
+    try:
+        last_f = float(last) if last not in (None, "") else None
+    except (TypeError, ValueError):
+        last_f = None
+
+    return {
+        "ts": time.time(), "series_id": series_id, "inst_id": inst_id,
+        "remaining_sec": remaining_sec, "last": last_f, "spread_pct": spread_pct,
+        "up_vwap": up_vwap, "up_slippage_pct": up_slippage_pct,
+        "up_book_ran_out": (not up_full) if up_vwap is not None else None,
+        "down_top_estimate": down_top_estimate, "down_diff_pct": down_diff_pct,
+    }
+
+
+def _print_liquidity_summary(rows: list[dict]) -> None:
+    print(f"\n{'=' * 64}\nSummary over {len(rows)} samples\n{'=' * 64}")
+    by_series: dict[str, list[dict]] = {}
+    for r in rows:
+        by_series.setdefault(r["series_id"], []).append(r)
+
+    for series_id, group in by_series.items():
+        slips = sorted(r["up_slippage_pct"] for r in group if r["up_slippage_pct"] is not None)
+        spreads = [r["spread_pct"] for r in group if r["spread_pct"] is not None]
+        remaining = [r["remaining_sec"] for r in group if r["remaining_sec"] is not None]
+        ran_out = sum(1 for r in group if r["up_book_ran_out"])
+
+        print(f"\n{series_id}  ({len(group)} samples)")
+        if slips:
+            median = slips[len(slips) // 2]
+            print(f"  UP slippage %:  min={slips[0]:+.1f}  median={median:+.1f}  "
+                  f"mean={sum(slips) / len(slips):+.1f}  max={slips[-1]:+.1f}")
+        else:
+            print("  UP slippage %: no usable samples")
+        if spreads:
+            print(f"  top-of-book spread %:  min={min(spreads):.1f}  "
+                  f"mean={sum(spreads) / len(spreads):.1f}  max={max(spreads):.1f}")
+        if remaining:
+            print(f"  remaining_sec at sample time:  min={min(remaining):.0f}  max={max(remaining):.0f}")
+        if ran_out:
+            print(f"  ⚠ book couldn't fully absorb the test order in {ran_out}/{len(group)} samples "
+                  f"— real slippage there is WORSE than what's reported")
+
+
+def _save_liquidity_csv(cfg, rows: list[dict]) -> Optional[Path]:
+    if not rows:
+        return None
+    data_dir = Path(cfg.storage.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    path = data_dir / f"liquidity_samples_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+    fieldnames = [
+        "ts", "series_id", "inst_id", "remaining_sec", "last", "spread_pct",
+        "up_vwap", "up_slippage_pct", "up_book_ran_out", "down_top_estimate", "down_diff_pct",
+    ]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"\nRaw samples saved to {path} (mounted volume — readable from the host too)")
+    return path
+
+
+async def check_liquidity(
+    cfg, test_stake_usd: float = 20.0, samples: int = 1, interval_sec: float = 30.0,
+) -> None:
     """Utility mode: for every live Event Contract instrument currently open
     on the configured series, print its real ticker (last/bidPx/askPx),
     the computed bid/ask spread, AND a simulated market-order fill for a
@@ -132,13 +305,19 @@ async def check_liquidity(cfg, test_stake_usd: float = 20.0) -> None:
     series/markets discovery calls, which do need a signed request — see
     okx_client.py), and no order is ever placed — zero execution risk.
 
+    With `samples > 1`, repeats every `interval_sec` and prints a summary
+    (min/median/mean/max UP slippage %, spread %, observed remaining_sec
+    range) plus writes every raw sample to a CSV under the data dir — the
+    point being to see whether slippage is a one-off or a consistent
+    pattern before changing anything in the engine itself.
+
     Caveat: the book/ticker only clearly represents the UP/YES side's own
     bid-ask (see models.py EventMarket — OKX gives one px per instrument,
-    not separate UP/DOWN books). The DOWN simulation below walks the BID
-    side as an approximation (going DOWN ~= selling into the UP book's
-    bids, i.e. paying `1 - vwap_bid`) — OKX doesn't publicly document the
-    exact internal matching for the non-primary side, so treat the DOWN
-    number as directional, not exact.
+    not separate UP/DOWN books). The DOWN estimate is top-of-book only
+    (1 - best_bid), explicitly NOT a depth simulation — OKX doesn't
+    publicly document the exact internal matching for the non-primary
+    side, and walking multiple bid levels there produces nonsense (see
+    git history — an earlier version of this tool did that and was wrong).
     """
     if not (cfg.okx.api_key and cfg.okx.api_secret and cfg.okx.api_passphrase):
         print(
@@ -149,105 +328,30 @@ async def check_liquidity(cfg, test_stake_usd: float = 20.0) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+    if samples < 1:
+        print("--samples must be >= 1", file=sys.stderr)
+        sys.exit(1)
 
     client_cfg = OKXClientConfig(
         base_url=cfg.okx.base_url, api_key=cfg.okx.api_key, api_secret=cfg.okx.api_secret,
         api_passphrase=cfg.okx.api_passphrase, demo_trading=cfg.okx.demo_trading,
         timeout_sec=cfg.okx.request_timeout_sec, max_retries=cfg.okx.max_retries,
     )
+    all_rows: list[dict] = []
     async with OKXClient(client_cfg) as client:
-        for series_id in cfg.okx.series_ids:
-            try:
-                markets = await client.get_event_markets(series_id=series_id, state="live")
-            except Exception as exc:
-                print(f"{series_id}: failed to list live markets ({exc})")
-                continue
-            if not markets:
-                print(f"{series_id}: no live markets right now")
-                continue
+        for i in range(samples):
+            if samples > 1:
+                print(f"\n{'#' * 64}\n# Sample {i + 1}/{samples}  —  {time.strftime('%H:%M:%S')}\n{'#' * 64}")
+            for series_id in cfg.okx.series_ids:
+                row = await _measure_series_liquidity(client, series_id, test_stake_usd)
+                if row is not None:
+                    all_rows.append(row)
+            if samples > 1 and i < samples - 1:
+                await asyncio.sleep(interval_sec)
 
-            # nearest-expiry instrument, same pick the engine itself trades
-            def _exp(m: dict) -> float:
-                raw = m.get("expTime")
-                try:
-                    return float(raw)
-                except (TypeError, ValueError):
-                    return float("inf")
-            chosen = min(markets, key=_exp)
-            inst_id = str(chosen.get("instId", "?"))
-
-            try:
-                ticker = await client.get_ticker(inst_id)
-                book = await client.get_orderbook(inst_id, sz=20)
-            except Exception as exc:
-                print(f"{series_id} ({inst_id}): failed to fetch ticker/book ({exc})")
-                continue
-
-            print(f"\n{series_id}  ->  {inst_id}")
-            last = None
-            if not ticker:
-                print("  ticker: <empty — no live quote>")
-            else:
-                row = ticker[0]
-                last, bid, ask = row.get("last"), row.get("bidPx"), row.get("askPx")
-                bid_sz, ask_sz = row.get("bidSz"), row.get("askSz")
-                print(f"  ticker: last={last}  bid={bid}({bid_sz})  ask={ask}({ask_sz})")
-                try:
-                    bid_f, ask_f = float(bid), float(ask)
-                    mid = (bid_f + ask_f) / 2
-                    spread_abs = ask_f - bid_f
-                    spread_pct = (spread_abs / mid * 100) if mid else float("nan")
-                    print(f"  top-of-book spread: {spread_abs:.4f} absolute  ({spread_pct:.1f}% of mid {mid:.4f})")
-                except (TypeError, ValueError):
-                    pass
-
-            if not book:
-                print("  book: <empty> — can't simulate a fill")
-                continue
-
-            b = book[0]
-            asks, bids = b.get("asks", []), b.get("bids", [])
-            print(f"  book depth: {len(bids)} bid levels / {len(asks)} ask levels")
-
-            # UP: walking real ask depth for a real BUY UP is a faithful
-            # simulation (you're buying exactly the instrument those asks
-            # are quoting).
-            up_vwap, up_contracts, up_spent, up_full = _simulate_market_fill(asks, test_stake_usd)
-
-            print(f"  simulated ${test_stake_usd:.2f} market BUY UP:")
-            if up_vwap is None:
-                print("    <no ask liquidity at all>")
-            else:
-                print(f"    vwap_fill={up_vwap:.4f}  contracts={up_contracts:.2f}  "
-                      f"spent=${up_spent:.2f}  {'(fully filled)' if up_full else '(BOOK RAN OUT — worse in reality)'}")
-                try:
-                    engine_price = float(last) if last not in (None, "") else float(asks[0][0])
-                    slippage_pct = (up_vwap - engine_price) / engine_price * 100
-                    print(f"    vs engine's simulated entry ({engine_price:.4f}): {slippage_pct:+.1f}% slippage")
-                except (TypeError, ValueError, IndexError):
-                    pass
-
-            # DOWN: bids are OTHER traders' resting buy-UP orders, not a
-            # depth of offers to sell you DOWN — walking multiple levels
-            # like we do for UP is not a faithful simulation (OKX doesn't
-            # publicly document how a DOWN/"no" order actually matches
-            # internally), and produces nonsense once the top level is
-            # thin. Report only the top-of-book estimate (1 - best_bid) as
-            # a best-case floor, explicitly NOT a depth simulation.
-            print(f"  DOWN top-of-book estimate (best case only — NOT a depth simulation, see docstring):")
-            if not bids:
-                print("    <no bid liquidity at all>")
-            else:
-                try:
-                    best_bid = float(bids[0][0])
-                    down_top_estimate = round(1 - best_bid, 4)
-                    engine_price = round(1 - float(last), 4) if last not in (None, "") else down_top_estimate
-                    diff_pct = ((down_top_estimate - engine_price) / engine_price * 100) if engine_price else float("nan")
-                    print(f"    best case ~{down_top_estimate:.4f} (vs engine's {engine_price:.4f}: {diff_pct:+.1f}%) "
-                          f"— a real fill only gets WORSE (higher) than this the deeper the order has to walk; "
-                          f"how much worse isn't something the public book tells us for this side.")
-                except (TypeError, ValueError, IndexError, ZeroDivisionError):
-                    pass
+    if samples > 1:
+        _print_liquidity_summary(all_rows)
+        _save_liquidity_csv(cfg, all_rows)
 
 
 async def run_bot(cfg) -> None:
@@ -353,6 +457,18 @@ def main() -> None:
              "roughly matching a typical live stake)",
     )
     parser.add_argument(
+        "--samples", type=int, default=1, metavar="N",
+        help="repeat --check-liquidity N times (default: 1, i.e. a single snapshot) "
+             "and print a min/median/mean/max summary at the end, plus save every raw "
+             "sample to a CSV under the data dir — use this to see whether slippage is "
+             "a one-off or a consistent pattern before changing the engine",
+    )
+    parser.add_argument(
+        "--interval-sec", type=float, default=30.0, metavar="SEC",
+        help="seconds to wait between --check-liquidity samples when --samples > 1 "
+             "(default: 30)",
+    )
+    parser.add_argument(
         "--reset-data", action="store_true",
         help="wipe data/bot.db (all strategies), then exit "
              "(equivalent to the web dashboard's Reset DB button, for console-mode users)",
@@ -372,7 +488,9 @@ def main() -> None:
         return
 
     if args.check_liquidity:
-        asyncio.run(check_liquidity(cfg, test_stake_usd=args.test_stake))
+        asyncio.run(check_liquidity(
+            cfg, test_stake_usd=args.test_stake, samples=args.samples, interval_sec=args.interval_sec,
+        ))
         return
 
     if args.reset_data:
