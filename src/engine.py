@@ -45,6 +45,7 @@ class Engine:
         self.wallets: dict[str, VirtualWallet] = {}
         self.strategy_instances: dict[str, BaseStrategy] = {}
         self._settlement_attempts: dict[str, int] = {}
+        self._last_settlement_check: dict[str, float] = {}
         self._last_snapshot_write = 0.0
         self._running = False
 
@@ -115,6 +116,7 @@ class Engine:
         self._build_wallets_and_strategies()  # fresh wallets AND fresh strategy instances
         self._close_strategies_soon(old_strategies)  # e.g. ai_prompt's old HTTP session
         self._settlement_attempts.clear()
+        self._last_settlement_check.clear()
         self.timing = EntryWindowManager()
         self._last_snapshot_write = 0.0
         self.storage.reset()
@@ -326,11 +328,30 @@ class Engine:
 
     # -- settling trades --------------------------------------------------------------
     async def _settle_expired_trades(self) -> None:
+        """Poll OKX for the real settlement outcome of every expired-but-
+        still-open trade. Checks are throttled to at most one per trade
+        every `settlement_poll_interval_sec` (previously this field was
+        parsed from config.yaml but never actually used — a settlement
+        check fired on every single engine tick regardless, so the real
+        give-up window was `settlement_poll_attempts * poll_interval_sec`,
+        not `* settlement_poll_interval_sec` as the config implied. Now it
+        does what it says.) After `settlement_poll_attempts` checks with
+        still no definitive outcome, the stake is refunded
+        (`mark_unresolved`) rather than left distorting win/loss stats —
+        see the "не засчиталась в статистику" conversation this was added
+        for: that's what an UNRESOLVED trade looks like on the dashboard
+        (0W/0L, $0 PnL, gone from Активные сделки)."""
         now = time.time()
+        poll_interval = self.cfg.okx.settlement_poll_interval_sec
         for wallet in self.wallets.values():
             for trade in list(wallet.open_trades()):
                 if now < trade.expiry_ts:
                     continue
+
+                last_check = self._last_settlement_check.get(trade.id, 0.0)
+                if now - last_check < poll_interval:
+                    continue  # not due for another settlement check yet
+                self._last_settlement_check[trade.id] = now
 
                 winning_direction = await self.provider.check_settlement(trade.series_id, trade.inst_id)
                 if winning_direction is None:
@@ -338,15 +359,17 @@ class Engine:
                     self._settlement_attempts[trade.id] = attempts
                     if attempts >= self.cfg.okx.settlement_poll_attempts:
                         logger.warning(
-                            "Settlement unresolved after %d attempts for %s (%s) — "
+                            "Settlement unresolved after %d attempts (~%.0fs) for %s (%s) — "
                             "refunding stake so it doesn't distort stats.",
-                            attempts, trade.id, trade.inst_id,
+                            attempts, attempts * poll_interval, trade.id, trade.inst_id,
                         )
                         wallet.mark_unresolved(trade)
                         self._settlement_attempts.pop(trade.id, None)
+                        self._last_settlement_check.pop(trade.id, None)
                     continue
 
                 self._settlement_attempts.pop(trade.id, None)
+                self._last_settlement_check.pop(trade.id, None)
                 outcome = winning_direction == trade.direction
                 wallet.settle_trade(trade, won=outcome)
                 logger.info(

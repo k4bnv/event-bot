@@ -9,7 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import AppConfig, DashboardConfig, OkxConfig, StorageConfig, StrategyConfig
 from src.engine import Engine
 from src.mock_market import MockMarketDataProvider
-from src.models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot
+from src.models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, Trade, TradeStatus
 from src.storage import Storage
 from src.strategies.base import Signal
 
@@ -204,6 +204,105 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
 
 async def _async_result(value):
     return value
+
+
+class SettleExpiredTradesThrottleTests(unittest.IsolatedAsyncioTestCase):
+    """Covers the settlement-polling fix: settlement_poll_interval_sec was
+    parsed from config but never actually used — a check fired on every
+    single engine tick regardless, so the real give-up window was
+    `settlement_poll_attempts * poll_interval_sec`, not
+    `* settlement_poll_interval_sec` as config.yaml implied. Live testing
+    showed real trades going UNRESOLVED within that (too-short) window."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    def _make_expired_trade(self) -> Trade:
+        return Trade(
+            strategy="breakout_retest", entry_window_min=7, series_id="S", inst_id="I",
+            direction=Direction.UP, entry_price=0.4, stake_usd=10.0, contracts=25.0,
+            opened_ts=time.time() - 120, expiry_ts=time.time() - 60,
+        )
+
+    def _expire_throttle_window(self, engine: Engine, trade_id: str) -> None:
+        """Simulate settlement_poll_interval_sec having elapsed since the
+        last check, without an actual sleep."""
+        if trade_id in engine._last_settlement_check:
+            engine._last_settlement_check[trade_id] -= engine.cfg.okx.settlement_poll_interval_sec + 0.01
+
+    async def test_settlement_check_is_throttled_by_interval(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            wallet = engine.wallets["breakout_retest"]
+            trade = self._make_expired_trade()
+            wallet.open_trade(trade)
+
+            call_count = 0
+
+            async def fake_check_settlement(series_id, inst_id):
+                nonlocal call_count
+                call_count += 1
+                return None
+
+            engine.provider.check_settlement = fake_check_settlement
+
+            # Three ticks in immediate succession — should only actually
+            # call check_settlement once, not three times.
+            await engine._settle_expired_trades()
+            await engine._settle_expired_trades()
+            await engine._settle_expired_trades()
+            self.assertEqual(call_count, 1)
+
+            self._expire_throttle_window(engine, trade.id)
+            await engine._settle_expired_trades()
+            self.assertEqual(call_count, 2)
+            engine.storage.close()
+
+    async def test_marks_unresolved_after_max_attempts_and_refunds_stake(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            wallet = engine.wallets["breakout_retest"]
+            trade = self._make_expired_trade()
+            wallet.open_trade(trade)
+            balance_after_open = wallet.balance
+
+            async def never_settles(series_id, inst_id):
+                return None
+
+            engine.provider.check_settlement = never_settles
+
+            max_attempts = engine.cfg.okx.settlement_poll_attempts
+            for _ in range(max_attempts):
+                await engine._settle_expired_trades()
+                self._expire_throttle_window(engine, trade.id)
+
+            self.assertEqual(trade.status, TradeStatus.UNRESOLVED)
+            self.assertEqual(trade.pnl_usd, 0.0)
+            self.assertEqual(wallet.balance, balance_after_open + trade.stake_usd)  # stake refunded
+            self.assertNotIn(trade.id, engine._settlement_attempts)
+            self.assertNotIn(trade.id, engine._last_settlement_check)
+            engine.storage.close()
+
+    async def test_settles_normally_once_outcome_is_available(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            wallet = engine.wallets["breakout_retest"]
+            trade = self._make_expired_trade()  # direction UP
+            wallet.open_trade(trade)
+
+            async def settles_up(series_id, inst_id):
+                return Direction.UP
+
+            engine.provider.check_settlement = settles_up
+            await engine._settle_expired_trades()
+
+            self.assertEqual(trade.status, TradeStatus.WON)
+            self.assertNotIn(trade.id, engine._settlement_attempts)
+            self.assertNotIn(trade.id, engine._last_settlement_check)
+            engine.storage.close()
 
 
 if __name__ == "__main__":

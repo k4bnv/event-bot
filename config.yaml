@@ -27,9 +27,17 @@ okx:
   max_retries: 5
   retry_backoff_base_sec: 1.5
   # After a contract's expiry we poll a few more times waiting for OKX to
-  # settle it (price snaps to 0 or 1) before giving up.
-  settlement_poll_attempts: 10
-  settlement_poll_interval_sec: 2
+  # actually publish the settlement outcome before giving up and refunding
+  # the stake as UNRESOLVED (counted in "Сделок" but not W/L — shows as
+  # 0W/0L, $0 PnL, and disappears from Активные сделки). Give-up window =
+  # attempts * interval — was effectively only ~20-30s (a bug: this
+  # interval field was parsed but never actually used, so checks fired on
+  # every engine poll tick instead), and live testing showed a lot of
+  # trades going unresolved in that window — OKX apparently often takes
+  # longer than that to publish `outcome`. Raised accordingly; if you still
+  # see a lot of UNRESOLVED trades, raise settlement_poll_attempts further.
+  settlement_poll_attempts: 30
+  settlement_poll_interval_sec: 3
   # BTC perpetual swap used by the funding_skew strategy. Funding only
   # settles every 8h, so we don't re-fetch it every poll tick.
   funding_inst_id: "BTC-USDT-SWAP"
