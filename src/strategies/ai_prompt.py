@@ -39,7 +39,10 @@ from typing import Optional
 
 from ..models import Direction, PricePoint
 from .base import BaseStrategy, Signal, StrategyContext
-from .fair_value_edge import compute_barrier_stats
+from .fair_value_edge import (
+    DEFAULT_MIN_SIGMA_PCT_PER_MIN, DEFAULT_UNFIXED_STRIKE_BASIS_PCT,
+    basis_sigma_for_market, compute_barrier_stats, min_sigma_per_sec_from_pct,
+)
 
 try:
     from ..llm_client import ChatAPIError, ChatClient, ChatClientConfig
@@ -248,7 +251,11 @@ class AIPromptStrategy(BaseStrategy):
 
         spot = ctx.price_history[-1].price if ctx.price_history else None
         barrier = (
-            compute_barrier_stats(recent, spot, market.floor_strike, ctx.remaining_sec)
+            compute_barrier_stats(
+                recent, spot, market.floor_strike, ctx.remaining_sec,
+                min_sigma_per_sec=min_sigma_per_sec_from_pct(DEFAULT_MIN_SIGMA_PCT_PER_MIN),
+                basis_sigma=basis_sigma_for_market(market, DEFAULT_UNFIXED_STRIKE_BASIS_PCT),
+            )
             if spot is not None and market.floor_strike is not None else None
         )
         drift_5m = _pct_change_over(ctx.price_history, now, 300) if ctx.price_history else None

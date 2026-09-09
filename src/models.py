@@ -114,6 +114,15 @@ class EventMarket:
     up_price: Optional[float] = None       # px: probability the primary side (UP/YES) wins
     state: str = "live"                    # preopen | live | settling | expired
     book: Optional[OrderBookSnapshot] = None   # this instrument's own live order book (not the underlying's)
+    # True: floor_strike is OKX's own fixed reference for this window
+    # (fixTime set — see market_data.py). False: OKX hasn't fixed one yet
+    # and floor_strike is our own proxy (the first price we happened to
+    # observe for this window) — same basis risk as a Kalshi bot proxying
+    # its settlement reference through Coinbase when the exchange's own
+    # reference isn't available yet. None: unknown/not applicable (e.g.
+    # mock data, or a method that doesn't use a window-relative strike at
+    # all) — treated the same as True, i.e. no extra uncertainty assumed.
+    strike_is_fixed: Optional[bool] = None
 
     def price_for(self, direction: Direction) -> Optional[float]:
         """Naive quoted price (last/mid, ignoring depth) — what strategies

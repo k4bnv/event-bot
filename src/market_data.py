@@ -281,7 +281,7 @@ class OkxMarketDataProvider(MarketDataProvider):
         self._active_markets[series_id] = EventMarket(
             series_id=series_id, method=method, inst_id=inst_id, expiry_ts=nearest_expiry,
             floor_strike=floor_strike, up_price=up_price, state=str(chosen.get("state", "live")),
-            book=book,
+            book=book, strike_is_fixed=is_fixed,
         )
 
     async def check_settlement(self, series_id: str, inst_id: str) -> Optional[Direction]:

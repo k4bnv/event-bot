@@ -119,6 +119,13 @@ strategies:
     stake_fraction: 0.01
     lookback_sec: 120
     min_edge: 0.08                     # min |model_prob - market_px| to trade (0.08 = 8 percentage points)
+    # Two robustness terms adapted from a comparable open-source Kalshi BTC
+    # bot (github.com/preceptress/btc-15-minute-prediction-model) — see
+    # src/strategies/fair_value_edge.py's module docstring. Defaults below
+    # match what that project uses for the same underlying (BTC); uncomment
+    # to override.
+    # min_sigma_pct_per_min: 0.035      # floor on realized vol (%/min) — stops a flat stretch making the model overconfident
+    # unfixed_strike_basis_pct: 0.075   # extra uncertainty (log-scale %) applied when OKX hasn't fixed this window's reference yet
 
   funding_skew:
     enabled: true

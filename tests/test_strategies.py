@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 import time
@@ -12,7 +13,9 @@ from src.strategies.ai_prompt import (
     BARRIER_PROMPT_TEMPLATE, AIPromptStrategy, build_client_config, _guess_symbol, _pct_change_over,
 )
 from src.strategies.base import StrategyContext
-from src.strategies.fair_value_edge import FairValueEdgeStrategy, fair_probability_up
+from src.strategies.fair_value_edge import (
+    FairValueEdgeStrategy, basis_sigma_for_market, fair_probability_up, min_sigma_per_sec_from_pct,
+)
 from src.strategies.funding_skew import FundingSkewStrategy
 from src.strategies.volatility_breakout import VolatilityBreakoutStrategy
 
@@ -21,11 +24,13 @@ def make_points(prices: list[float], start_ts: float = 0.0, dt: float = 1.0) -> 
     return [PricePoint(ts=start_ts + i * dt, price=p) for i, p in enumerate(prices)]
 
 
-def make_market(up_price=None, floor_strike=None, method="price_up_down", expiry_ts=None) -> EventMarket:
+def make_market(
+    up_price=None, floor_strike=None, method="price_up_down", expiry_ts=None, strike_is_fixed=None,
+) -> EventMarket:
     return EventMarket(
         series_id="TEST-SERIES", method=method, inst_id="TEST-INST-1",
         expiry_ts=expiry_ts or time.time() + 300, floor_strike=floor_strike,
-        up_price=up_price, state="live",
+        up_price=up_price, state="live", strike_is_fixed=strike_is_fixed,
     )
 
 
@@ -58,6 +63,68 @@ class FairValueEdgeMathTests(unittest.TestCase):
     def test_none_with_zero_volatility(self):
         points = make_points([100.0] * 15)
         self.assertIsNone(fair_probability_up(points, 100.0, 100.0, 60))
+
+
+class BarrierRobustnessTests(unittest.IsolatedAsyncioTestCase):
+    """Covers the two robustness terms adapted from
+    preceptress/btc-15-minute-prediction-model — see fair_value_edge.py's
+    module docstring."""
+
+    def test_min_sigma_per_sec_from_pct_scales_by_sqrt_time(self):
+        # 0.06%/min floor -> per-second sigma is that /100 /sqrt(60).
+        self.assertAlmostEqual(min_sigma_per_sec_from_pct(0.06), 0.0006 / math.sqrt(60), places=10)
+
+    def test_min_sigma_per_sec_from_pct_clamps_negative_to_zero(self):
+        self.assertEqual(min_sigma_per_sec_from_pct(-1.0), 0.0)
+
+    def test_basis_sigma_is_zero_when_strike_is_fixed_or_unknown(self):
+        self.assertEqual(basis_sigma_for_market(make_market(strike_is_fixed=True), 0.075), 0.0)
+        self.assertEqual(basis_sigma_for_market(make_market(strike_is_fixed=None), 0.075), 0.0)
+
+    def test_basis_sigma_applies_only_when_explicitly_unfixed(self):
+        self.assertAlmostEqual(basis_sigma_for_market(make_market(strike_is_fixed=False), 0.075), 0.00075)
+
+    def test_volatility_floor_turns_zero_variance_into_a_real_probability(self):
+        # Same fixture as FairValueEdgeMathTests.test_none_with_zero_volatility
+        # (flat prices -> exactly zero realized variance) — WITHOUT a floor
+        # this still gives up (see that test); WITH one, price==strike
+        # should resolve to ~0.5 instead of just refusing to answer.
+        points = make_points([100.0] * 15)
+        prob = fair_probability_up(
+            points, 100.0, 100.0, 60, min_sigma_per_sec=min_sigma_per_sec_from_pct(0.035),
+        )
+        self.assertIsNotNone(prob)
+        self.assertAlmostEqual(prob, 0.5, delta=0.01)
+
+    def test_basis_sigma_pulls_an_off_strike_probability_toward_half(self):
+        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
+        points = make_points(noisy)
+        without_basis = fair_probability_up(points, 101.0, 100.0, 60)
+        with_basis = fair_probability_up(points, 101.0, 100.0, 60, basis_sigma=0.02)
+        self.assertIsNotNone(without_basis)
+        self.assertIsNotNone(with_basis)
+        self.assertGreater(without_basis, 0.5)  # price above strike -> P(UP) > 0.5 either way
+        # More uncertainty (unfixed/proxied strike) should make the estimate
+        # LESS extreme, i.e. closer to the uninformative 0.5, not more.
+        self.assertLess(with_basis, without_basis)
+
+    async def test_unfixed_strike_can_suppress_a_signal_the_fixed_case_would_take(self):
+        # Price has drifted to 101 against a strike of 100 (only the LAST
+        # point matters as the strategy's anchor — see evaluate()'s
+        # points[-1].price) — a real edge, not the price==strike symmetric
+        # case where z stays 0 regardless of sigma and basis_sigma would
+        # have no effect to test at all.
+        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(19)] + [101.0]
+        points = make_points(noisy)
+        strategy = FairValueEdgeStrategy(config={"min_edge": 0.08, "unfixed_strike_basis_pct": 5.0})
+
+        fixed_market = make_market(up_price=0.55, floor_strike=100.0, strike_is_fixed=True)
+        signal = await strategy.evaluate(make_ctx(points, remaining_sec=120, market=fixed_market))
+        self.assertIsNotNone(signal)  # model P(UP)=0.652 vs market 0.55 -> edge 0.102, above min_edge
+
+        unfixed_market = make_market(up_price=0.55, floor_strike=100.0, strike_is_fixed=False)
+        signal2 = await strategy.evaluate(make_ctx(points, remaining_sec=120, market=unfixed_market))
+        self.assertIsNone(signal2)  # basis uncertainty pulls P(UP) to 0.570 -> edge 0.020, below min_edge
 
 
 class FairValueEdgeStrategyTests(unittest.IsolatedAsyncioTestCase):

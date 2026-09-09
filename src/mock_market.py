@@ -63,6 +63,7 @@ class MockMarketDataProvider(MarketDataProvider):
         self._active_markets[series_id] = EventMarket(
             series_id=series_id, method="price_up_down", inst_id=inst_id,
             expiry_ts=expiry_ts, floor_strike=strike, state="live",
+            strike_is_fixed=True,  # generated ground truth, never a proxy
         )
 
     def _finalize_window(self, series_id: str) -> None:
