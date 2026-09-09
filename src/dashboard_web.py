@@ -33,7 +33,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from .config import AppConfig
 from .engine import Engine
 from .models import TradeStatus
-from .storage import TRADE_FIELDS
+from .storage import FEATURE_FIELDS, TRADE_FIELDS
 
 AUTH_COOKIE_NAME = "okx_bot_session"
 AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days — "куки хранились"
@@ -194,13 +194,15 @@ INDEX_HTML = """<!doctype html>
   .legend { display:flex; gap:14px; flex-wrap:wrap; font-size:12px; margin-top:8px; }
   .legend-item { display:flex; align-items:center; gap:6px; }
   .legend-dot { width:10px; height:10px; border-radius:2px; display:inline-block; }
+  .chart-note { font-size:12px; color:#898781; margin-top:6px; }
   .analytics-controls { display:flex; gap:12px; align-items:center; margin-bottom:12px; font-size:13px; flex-wrap:wrap; }
   .analytics-controls select { background:#0f1115; color:#e6e6e6; border:1px solid #2a2e37;
     border-radius:5px; padding:4px 8px; }
-  #exportCsvBtn { background:#171a21; color:#7fc7ff; border:1px solid #2b4a6b; border-radius:6px;
-    padding:5px 12px; font-size:12px; cursor:pointer; }
-  #exportCsvBtn:hover { background:#1f2e3a; }
+  #exportCsvBtn, #exportFeaturesCsvBtn { background:#171a21; color:#7fc7ff; border:1px solid #2b4a6b;
+    border-radius:6px; padding:5px 12px; font-size:12px; cursor:pointer; }
+  #exportCsvBtn:hover, #exportFeaturesCsvBtn:hover { background:#1f2e3a; }
   .trades-stats { font-size:12px; color:#9aa0a6; margin-bottom:10px; }
+  .hbar-row:hover rect { filter:brightness(1.15); }
   .table-scroll { overflow-x:auto; }
   #tradesTable th.sortable { cursor:pointer; user-select:none; white-space:nowrap; }
   #tradesTable th.sortable:hover { color:#e6e6e6; }
@@ -278,10 +280,14 @@ INDEX_HTML = """<!doctype html>
   </div>
 
   <div id="analyticsView" style="display:none;">
-    <div class="card chart-card"><h3>Кривая эквити по стратегиям</h3><div id="equityChart"></div></div>
+    <div class="card chart-card">
+      <h3>Кривая эквити по стратегиям</h3>
+      <div id="equityChart"></div>
+      <div id="equityNote" class="chart-note"></div>
+    </div>
     <div class="card chart-card"><h3>PnL по стратегиям, $</h3><div id="pnlChart"></div></div>
     <div class="card chart-card"><h3>Winrate по связкам «стратегия × окно», %</h3><div id="winrateChart"></div></div>
-    <div class="card"><h3>По часу входа (UTC)</h3><table id="byHour"></table></div>
+    <div class="card chart-card"><h3>По часу входа (UTC)</h3><div id="byHourChart"></div></div>
     <div class="card"><h3>По волатильности рынка при входе</h3><table id="byVolatility"></table></div>
     <div class="card"><h3>По направлению тренда при входе</h3><table id="byTrend"></table></div>
     <div class="card">
@@ -295,6 +301,14 @@ INDEX_HTML = """<!doctype html>
       <div id="tradesStats" class="trades-stats"></div>
       <div class="table-scroll"><table id="tradesTable"></table></div>
       <div class="pager" id="tradesPager"></div>
+    </div>
+    <div class="card">
+      <h3>Данные для обучения (ML)</h3>
+      <p class="chart-note">Полный лог каждой оценки чекпоинта (в т.ч. когда сигнала не было) —
+        см. таблицу checkpoint_features. Строк: <span id="featuresCount">…</span></p>
+      <div class="analytics-controls">
+        <button id="exportFeaturesCsvBtn" onclick="exportFeaturesCsv()">⬇ Экспорт CSV для обучения</button>
+      </div>
     </div>
   </div>
 
@@ -350,7 +364,24 @@ const TRADE_COLUMNS = [
   { key: 'roi_pct', label: 'ROI %' },
   { key: 'reason', label: 'Причина' },
 ];
-const PALETTE = ['#7fc7ff', '#3ddc84', '#ffb84d', '#ff6b6b', '#c792ea', '#4dd0e1', '#f06292', '#a1887f'];
+// Validated categorical palette (dark-surface steps) — CVD-safe adjacent
+// order for stacks/bars/lines, up to 8 series (see dataviz skill /
+// references/palette.md). Past 8 series, fold the tail rather than
+// generate a 9th hue — see renderAnalytics' equity chart.
+const PALETTE = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9', '#e66767'];
+// Status pair — matches the .pos/.neg text color already used everywhere
+// else on this page (wallets/trades tables), so a chart's green/red means
+// the same thing as the rest of the dashboard.
+const STATUS_GOOD = '#3ddc84', STATUS_BAD = '#ff6b6b';
+// Sequential single-hue (blue) ramp for a 0..1 magnitude on a DARK chart
+// surface — brighter = higher, muted-toward-surface = lower (the dark-mode
+// mirror of "more is darker" on a light surface).
+function sequentialBlue(t){
+  t = Math.max(0, Math.min(1, t));
+  const lo = [24, 60, 100], hi = [140, 190, 245];   // muted navy -> bright blue
+  const mix = (a, b) => Math.round(a + (b - a) * t);
+  return `rgb(${mix(lo[0],hi[0])},${mix(lo[1],hi[1])},${mix(lo[2],hi[2])})`;
+}
 
 function showTab(tab){
   currentTab = tab;
@@ -367,6 +398,7 @@ function showTab(tab){
     if (!tradesFilterLoaded) loadTradesFilterOptions();
     loadTradesTable();
     loadPatterns();
+    loadFeaturesCount();
   }
   if (tab === 'logs') {
     if (!logsFilterLoaded) loadLogsFilterOptions();
@@ -545,12 +577,39 @@ function patternsTableHtml(headLabel, rows){
 async function loadPatterns(){
   const r = await fetch('/api/patterns');
   const d = await r.json();
-  document.getElementById('byHour').innerHTML = patternsTableHtml('Час', d.by_hour);
+
+  // Winrate as bar height (comparable, bounded 0-100%); color by PnL
+  // sign (status, same green/red the rest of the page already uses) —
+  // the exact trade count rides the value label so a thin, low-sample
+  // bar never gets mistaken for a well-supported one.
+  const hourItems = d.by_hour.map(x => ({
+    label: x.label, value: x.winrate_pct, color: x.net_pnl >= 0 ? STATUS_GOOD : STATUS_BAD,
+    valueLabel: `${x.winrate_pct.toFixed(0)}% (${x.trades})`,
+  }));
+  document.getElementById('byHourChart').innerHTML = svgBarChart(hourItems, 900, 220);
+
   document.getElementById('byVolatility').innerHTML = patternsTableHtml('Режим', d.by_volatility);
   document.getElementById('byTrend').innerHTML = patternsTableHtml('Тренд', d.by_trend);
 }
 
+function exportFeaturesCsv(){
+  window.location.href = '/api/features/export.csv';
+}
+
+async function loadFeaturesCount(){
+  const r = await fetch('/api/features/count');
+  const d = await r.json();
+  document.getElementById('featuresCount').textContent = d.count.toLocaleString('ru-RU');
+}
+
 // -- tiny inline-SVG charts (no charting library) ----------------------------------
+// Mark specs kept consistent across every chart below: hairline recessive
+// gridlines/axes (#2c2c2a), muted axis/label text (#898781), 2px round-cap
+// lines, bars capped at 24px with a 4px rounded data-end + 2px gap between
+// neighbors, value labels at the bar tip (never inside — these bars are
+// often too short for an inline label to fit), a native <title> per mark
+// as the hover layer (a real tooltip, just the browser's own rather than a
+// custom JS one).
 function svgLineChart(series, width, height){
   const pad = 34;
   let allPoints = series.flatMap(s => s.points);
@@ -562,14 +621,18 @@ function svgLineChart(series, width, height){
   const y = e => height - pad - (e - eMin) / eSpan * (height - 2 * pad);
 
   let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">`;
-  svg += `<line x1="${pad}" y1="${height-pad}" x2="${width-pad}" y2="${height-pad}" stroke="#2a2e37"/>`;
-  svg += `<line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height-pad}" stroke="#2a2e37"/>`;
-  svg += `<text x="4" y="${pad+4}" fill="#9aa0a6" font-size="10">$${eMax.toFixed(0)}</text>`;
-  svg += `<text x="4" y="${height-pad}" fill="#9aa0a6" font-size="10">$${eMin.toFixed(0)}</text>`;
+  svg += `<line x1="${pad}" y1="${height-pad}" x2="${width-pad}" y2="${height-pad}" stroke="#2c2c2a"/>`;
+  svg += `<line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height-pad}" stroke="#2c2c2a"/>`;
+  svg += `<text x="4" y="${pad+4}" fill="#898781" font-size="10">$${eMax.toFixed(0)}</text>`;
+  svg += `<text x="4" y="${height-pad}" fill="#898781" font-size="10">$${eMin.toFixed(0)}</text>`;
   series.forEach((s, i) => {
     if (s.points.length === 0) return;
     const d = s.points.map(p => `${x(p.t)},${y(p.equity)}`).join(' ');
-    svg += `<polyline points="${d}" fill="none" stroke="${s.color}" stroke-width="2"/>`;
+    svg += `<polyline points="${d}" fill="none" stroke="${s.color}" stroke-width="2" ` +
+           `stroke-linecap="round" stroke-linejoin="round"><title>${escapeHtml(s.name)}</title></polyline>`;
+    const last = s.points[s.points.length - 1];
+    svg += `<circle cx="${x(last.t)}" cy="${y(last.equity)}" r="5" fill="${s.color}" stroke="#171a21" stroke-width="2">` +
+           `<title>${escapeHtml(s.name)}: $${last.equity.toFixed(2)}</title></circle>`;
   });
   svg += '</svg>';
   return svg;
@@ -580,43 +643,112 @@ function svgBarChart(items, width, height){
   if (items.length === 0) return `<svg viewBox="0 0 ${width} ${height}"></svg>`;
   const vMax = Math.max(1, ...items.map(it => Math.abs(it.value)));
   const zeroY = height - pad;
-  const barW = (width - 2 * pad) / items.length;
+  const slot = (width - 2 * pad) / items.length;
+  const barWidth = Math.min(24, slot - 4);
   let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">`;
-  svg += `<line x1="${pad}" y1="${zeroY}" x2="${width-pad}" y2="${zeroY}" stroke="#2a2e37"/>`;
+  svg += `<line x1="${pad}" y1="${zeroY}" x2="${width-pad}" y2="${zeroY}" stroke="#2c2c2a"/>`;
   items.forEach((it, i) => {
-    const h = Math.abs(it.value) / vMax * (height - 2 * pad - 20);
-    const barX = pad + i * barW + barW * 0.15;
-    const barWidth = barW * 0.7;
+    const h = Math.max(Math.abs(it.value) / vMax * (height - 2 * pad - 20), 1);
+    const barX = pad + i * slot + (slot - barWidth) / 2;
     const barY = it.value >= 0 ? zeroY - h : zeroY;
-    svg += `<rect x="${barX}" y="${barY}" width="${barWidth}" height="${Math.max(h,1)}" fill="${it.color}"/>`;
-    svg += `<text x="${barX + barWidth/2}" y="${zeroY + 14}" fill="#9aa0a6" font-size="9" text-anchor="middle">` +
+    const r = Math.min(4, barWidth / 2, h);
+    const valueLabel = it.valueLabel ?? it.value.toFixed(1);
+    svg += `<rect x="${barX}" y="${barY}" width="${barWidth}" height="${h}" fill="${it.color}" rx="${r}" ry="${r}">` +
+           `<title>${escapeHtml(it.label)}: ${valueLabel}</title></rect>`;
+    svg += `<text x="${barX + barWidth/2}" y="${zeroY + 14}" fill="#898781" font-size="9" text-anchor="middle">` +
            `${it.label.length > 10 ? it.label.slice(0,10)+'…' : it.label}</text>`;
     svg += `<text x="${barX + barWidth/2}" y="${it.value >= 0 ? barY - 4 : barY + h + 12}" fill="#e6e6e6" ` +
-           `font-size="9" text-anchor="middle">${it.value.toFixed(1)}</text>`;
+           `font-size="9" text-anchor="middle">${valueLabel}</text>`;
+  });
+  svg += '</svg>';
+  return svg;
+}
+
+// Horizontal bars — the right form for MANY named categories (see the
+// dataviz skill's "more than ~7 classes -> a table, or table+chart":
+// this reads as both at once, label + exact value + bar, no rotated or
+// truncated-past-recognition labels the way a crowded vertical chart
+// forces). Height grows with item count rather than cramming everything
+// into a fixed box, so the card just gets taller, not denser.
+function svgHBarChart(items, width, rowHeight){
+  const labelW = 160, padRight = 46, padTop = 6;
+  const plotW = width - labelW - padRight;
+  const height = padTop * 2 + items.length * rowHeight;
+  if (items.length === 0) return `<svg viewBox="0 0 ${width} ${Math.max(height,1)}"></svg>`;
+  const vMax = Math.max(1e-9, ...items.map(it => Math.abs(it.value)));
+  let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">`;
+  const barH = Math.min(20, rowHeight - 6);
+  items.forEach((it, i) => {
+    const rowY = padTop + i * rowHeight;
+    const barY = rowY + (rowHeight - barH) / 2;
+    const w = Math.max(Math.abs(it.value) / vMax * plotW, 2);
+    const barX = labelW;
+    const r = Math.min(4, barH / 2, w);
+    const label = it.label.length > 24 ? it.label.slice(0, 24) + '…' : it.label;
+    const valueLabel = it.valueLabel ?? it.value.toFixed(1);
+    // Measure first: a bar long enough to leave no room for the value
+    // label past its tip must not just clip it off the edge of the SVG —
+    // move the label INSIDE the bar, right-aligned near its tip, in dark
+    // ink (every fill used here is a light/pastel tone, so dark ink
+    // clears contrast without a per-color luminance check).
+    const estLabelW = valueLabel.length * 6.5 + 6;
+    const fitsOutside = (barX + w + 6 + estLabelW) <= width;
+    svg += `<g class="hbar-row">`;
+    svg += `<text x="${labelW - 8}" y="${rowY + rowHeight/2 + 3}" fill="#c3c2b7" font-size="11" ` +
+           `text-anchor="end">${escapeHtml(label)}<title>${escapeHtml(it.label)}</title></text>`;
+    svg += `<rect x="${barX}" y="${barY}" width="${w}" height="${barH}" fill="${it.color}" rx="${r}" ry="${r}">` +
+           `<title>${escapeHtml(it.label)}: ${valueLabel}</title></rect>`;
+    if (fitsOutside) {
+      svg += `<text x="${barX + w + 6}" y="${rowY + rowHeight/2 + 3}" fill="#e6e6e6" font-size="11">${valueLabel}</text>`;
+    } else {
+      svg += `<text x="${barX + w - 6}" y="${rowY + rowHeight/2 + 3}" fill="#0b0b0b" font-size="11" ` +
+             `text-anchor="end">${valueLabel}</text>`;
+    }
+    svg += `</g>`;
   });
   svg += '</svg>';
   return svg;
 }
 
 function renderAnalytics(d){
-  const series = d.wallets.map((w, i) => ({
-    name: w.display_name, color: PALETTE[i % PALETTE.length], points: w.equity_curve || [],
+  // Equity curve compares STRATEGIES over time (identity job -> categorical
+  // color) — the validated palette only clears its CVD gates through 8
+  // series; past that, generating a 9th hue is worse than not having it
+  // (see the dataviz skill's series-count ladder), so only the top 8
+  // strategies by |PnL| get a line here. Nothing is hidden data-wise —
+  // every strategy's own numbers are still in the PnL/wallets views below.
+  const byAbsPnl = [...d.strategy_summary].sort((a, b) => Math.abs(b.net_pnl) - Math.abs(a.net_pnl));
+  const shown = byAbsPnl.slice(0, 8);
+  const series = shown.map((s, i) => ({
+    name: s.display_name, color: PALETTE[i % PALETTE.length], points: s.equity_curve || [],
   }));
   document.getElementById('equityChart').innerHTML = svgLineChart(series, 760, 260);
   const legend = series.map(s =>
     `<div class="legend-item"><span class="legend-dot" style="background:${s.color}"></span>${s.name}</div>`
   ).join('');
   document.getElementById('equityChart').innerHTML += `<div class="legend">${legend}</div>`;
+  document.getElementById('equityNote').textContent = byAbsPnl.length > 8
+    ? `Показаны 8 стратегий с наибольшим |PnL| из ${byAbsPnl.length} — остальные см. в PnL-графике ниже.`
+    : '';
 
-  const pnlItems = d.wallets.map((w, i) => ({
-    label: w.display_name, value: w.net_pnl, color: w.net_pnl >= 0 ? '#3ddc84' : '#ff6b6b',
-  }));
-  document.getElementById('pnlChart').innerHTML = svgBarChart(pnlItems, 760, 220);
+  // PnL/winrate are magnitude comparisons across MANY named categories —
+  // horizontal bars read as a table+chart at once (label, exact value,
+  // AND a bar), no rotated or truncated-past-recognition labels.
+  const pnlItems = [...d.strategy_summary]
+    .sort((a, b) => b.net_pnl - a.net_pnl)
+    .map(s => ({ label: s.display_name, value: s.net_pnl, color: s.net_pnl >= 0 ? STATUS_GOOD : STATUS_BAD,
+                 valueLabel: money(s.net_pnl) }));
+  document.getElementById('pnlChart').innerHTML = svgHBarChart(pnlItems, 760, 26);
 
-  const winrateItems = d.combos.map((c, i) => ({
-    label: `${c.display_name} @${c.window_min}м`, value: c.winrate_pct, color: PALETTE[i % PALETTE.length],
-  }));
-  document.getElementById('winrateChart').innerHTML = svgBarChart(winrateItems, 760, 220);
+  // Winrate is a 0-100% magnitude, not a signed value -> sequential
+  // single-hue color (brighter = higher), not the status green/red pair.
+  const winrateItems = [...d.combos]
+    .sort((a, b) => b.winrate_pct - a.winrate_pct)
+    .map(c => ({
+      label: `${c.display_name} @${c.window_min}м`, value: c.winrate_pct,
+      color: sequentialBlue(c.winrate_pct / 100), valueLabel: `${c.winrate_pct.toFixed(1)}% (${c.trades})`,
+    }));
+  document.getElementById('winrateChart').innerHTML = svgHBarChart(winrateItems, 760, 24);
 }
 
 async function loadStrategySettings(){
@@ -804,17 +936,21 @@ setInterval(tick, %REFRESH_MS%);
 """
 
 
-def _equity_curve(wallet, max_points: int = 300) -> list[dict]:
-    """Reconstruct a (timestamp, equity) series from a wallet's closed
-    trades — no separate snapshot table needed. Downsampled to
-    `max_points` (keeping the very last point) so a long-running strategy
-    doesn't bloat the /api/state payload every poll."""
-    closed = sorted((t for t in wallet.trades if t.closed_ts is not None), key=lambda t: t.closed_ts)
+def _equity_curve_from_trades(trades: list, initial_balance: float, max_points: int = 300) -> list[dict]:
+    """Reconstruct a (timestamp, equity) series from a set of closed
+    trades — no separate snapshot table needed. Works equally for one
+    wallet's own trades (see _equity_curve below) or several checkpoint
+    wallets' trades merged together (see /api/state's strategy_summary,
+    which needs one combined curve per STRATEGY, not one line per
+    checkpoint). Downsampled to `max_points` (keeping the very last
+    point) so a long-running strategy doesn't bloat the /api/state
+    payload every poll."""
+    closed = sorted((t for t in trades if t.closed_ts is not None), key=lambda t: t.closed_ts)
     if not closed:
-        return [{"t": time.time(), "equity": wallet.initial_balance}]
+        return [{"t": time.time(), "equity": initial_balance}]
 
-    points = [{"t": closed[0].opened_ts, "equity": wallet.initial_balance}]
-    equity = wallet.initial_balance
+    points = [{"t": closed[0].opened_ts, "equity": initial_balance}]
+    equity = initial_balance
     for t in closed:
         equity += t.pnl_usd or 0.0
         points.append({"t": t.closed_ts, "equity": equity})
@@ -826,6 +962,10 @@ def _equity_curve(wallet, max_points: int = 300) -> list[dict]:
             sampled.append(points[-1])
         points = sampled
     return points
+
+
+def _equity_curve(wallet, max_points: int = 300) -> list[dict]:
+    return _equity_curve_from_trades(wallet.trades, wallet.initial_balance, max_points)
 
 
 def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
@@ -955,6 +1095,30 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
             for w in sorted(snap.wallets.values(), key=lambda w: (w.strategy, -(w.window_min or 0)))
         ]
 
+        # One combined line per STRATEGY (not per checkpoint wallet) —
+        # the Analytics tab's equity/PnL charts compare strategies against
+        # each other, and 20+ checkpoint-level lines/bars is unreadable
+        # (see the dashboard's own history: that's exactly what this
+        # replaced). Each checkpoint's own numbers are still fully visible
+        # in `wallets` above and the "Стратегия × время входа" combos below.
+        strategy_groups: dict[str, list] = {}
+        for w in snap.wallets.values():
+            strategy_groups.setdefault(w.strategy, []).append(w)
+        strategy_summary = []
+        for strategy_name, group in strategy_groups.items():
+            initial_balance = sum(w.initial_balance for w in group)
+            equity = sum(w.equity for w in group)
+            all_trades = [t for w in group for t in w.trades]
+            strategy_summary.append({
+                "strategy": strategy_name,
+                "display_name": display_names.get(strategy_name, strategy_name),
+                "initial_balance": initial_balance,
+                "equity": equity,
+                "net_pnl": equity - initial_balance,
+                "equity_curve": _equity_curve_from_trades(all_trades, initial_balance),
+            })
+        strategy_summary.sort(key=lambda s: s["strategy"])
+
         combos = [
             {
                 "strategy": c.strategy,
@@ -996,6 +1160,7 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
                 "underlying_price": snap.underlying_price,
                 "updated_at": snap.updated_at,
                 "wallets": wallets,
+                "strategy_summary": strategy_summary,
                 "combos": combos,
                 "open_trades": open_trades,
                 "leaderboard": {
@@ -1064,6 +1229,28 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
             iter([buf.getvalue()]), media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+    @app.get("/api/features/export.csv")
+    async def export_features_csv(strategy: Optional[str] = None) -> StreamingResponse:
+        """Full checkpoint_features history (every checkpoint EVALUATION,
+        no_signal/rejected/opened alike — see storage.py's module
+        docstring for why the negative examples matter for training too)
+        as a downloadable CSV. Unfiltered by default — this is meant to
+        leave with the whole dataset, not one page of it."""
+        rows = engine.storage.get_checkpoint_features(strategy=strategy, limit=None)
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=FEATURE_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+        filename = f"checkpoint_features_{strategy or 'all'}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        return StreamingResponse(
+            iter([buf.getvalue()]), media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/features/count")
+    async def features_count(strategy: Optional[str] = None) -> JSONResponse:
+        return JSONResponse({"count": engine.storage.count_checkpoint_features(strategy=strategy)})
 
     @app.get("/api/activity")
     async def get_activity(since_id: int = 0, strategy: Optional[str] = None, limit: int = 300) -> JSONResponse:
