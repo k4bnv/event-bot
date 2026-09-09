@@ -2,9 +2,11 @@ from .ai_prompt import AIPromptStrategy
 from .base import BaseStrategy, Signal, StrategyContext
 from .breakout_retest import BreakoutRetestStrategy
 from .fair_value_edge import FairValueEdgeStrategy
+from .favorite_bias import FavoriteBiasStrategy
 from .funding_skew import FundingSkewStrategy
 from .mean_reversion import MeanReversionStrategy
 from .orderbook_momentum import OrderbookMomentumStrategy
+from .prior_window_momentum import PriorWindowMomentumStrategy
 from .volatility_breakout import VolatilityBreakoutStrategy
 
 STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
@@ -15,6 +17,8 @@ STRATEGY_REGISTRY: dict[str, type[BaseStrategy]] = {
     "fair_value_edge": FairValueEdgeStrategy,
     "funding_skew": FundingSkewStrategy,
     "ai_prompt": AIPromptStrategy,
+    "favorite_bias": FavoriteBiasStrategy,
+    "prior_window_momentum": PriorWindowMomentumStrategy,
 }
 
 __all__ = [
@@ -28,5 +32,7 @@ __all__ = [
     "FairValueEdgeStrategy",
     "FundingSkewStrategy",
     "AIPromptStrategy",
+    "FavoriteBiasStrategy",
+    "PriorWindowMomentumStrategy",
     "STRATEGY_REGISTRY",
 ]

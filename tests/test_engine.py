@@ -521,5 +521,143 @@ class ActivityFeedTests(unittest.IsolatedAsyncioTestCase):
             engine.storage.close()
 
 
+class PreviousOutcomeTrackingTests(unittest.IsolatedAsyncioTestCase):
+    """Covers Engine._update_previous_outcomes() — the plumbing
+    prior_window_momentum needs: learning a window's settlement outcome
+    the moment it rolls over, independent of whether any strategy actually
+    traded it (unlike the normal per-Trade settlement-polling path)."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    @staticmethod
+    def _set_market(engine: Engine, series_id: str, inst_id: str) -> None:
+        engine.provider._active_markets[series_id] = EventMarket(
+            series_id=series_id, method="price_up_down", inst_id=inst_id,
+            expiry_ts=time.time() + 300, floor_strike=50000.0, up_price=0.5, state="live",
+        )
+
+    async def test_no_lookup_on_first_ever_observation(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            self._set_market(engine, series_id, "INST-A")
+
+            calls = []
+            engine.provider.check_settlement = lambda s, i: calls.append((s, i)) or _resolved(None)
+
+            await engine._update_previous_outcomes()
+
+            self.assertEqual(calls, [])  # nothing to look up yet — no prior window observed at all
+            self.assertIsNone(engine._previous_outcome.get(series_id))
+            self.assertEqual(engine._last_inst_id[series_id], "INST-A")
+            engine.storage.close()
+
+    async def test_rollover_resolves_immediately(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            self._set_market(engine, series_id, "INST-A")
+            await engine._update_previous_outcomes()  # establishes INST-A as "last seen"
+
+            self._set_market(engine, series_id, "INST-B")  # rollover
+            engine.provider.check_settlement = lambda s, i: _resolved(Direction.UP if i == "INST-A" else None)
+
+            await engine._update_previous_outcomes()
+
+            self.assertEqual(engine._previous_outcome[series_id], Direction.UP)
+            self.assertNotIn(series_id, engine._pending_outcome_inst_id)  # resolved immediately, nothing pending
+            self.assertEqual(engine._last_inst_id[series_id], "INST-B")
+            engine.storage.close()
+
+    async def test_rollover_pending_then_resolves_on_retry(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            self._set_market(engine, series_id, "INST-A")
+            await engine._update_previous_outcomes()
+
+            self._set_market(engine, series_id, "INST-B")
+            responses = iter([None, None, Direction.DOWN])  # not yet, not yet, resolved
+            engine.provider.check_settlement = lambda s, i: _resolved(next(responses))
+
+            await engine._update_previous_outcomes()  # rollover tick: first attempt -> None
+            self.assertIsNone(engine._previous_outcome.get(series_id))
+            self.assertEqual(engine._pending_outcome_inst_id[series_id], "INST-A")
+
+            # advance past settlement_poll_interval_sec so the retry is due
+            engine._last_outcome_check[series_id] -= engine.cfg.okx.settlement_poll_interval_sec + 1
+            await engine._update_previous_outcomes()  # second attempt -> still None
+            self.assertIsNone(engine._previous_outcome.get(series_id))
+
+            engine._last_outcome_check[series_id] -= engine.cfg.okx.settlement_poll_interval_sec + 1
+            await engine._update_previous_outcomes()  # third attempt -> resolved
+            self.assertEqual(engine._previous_outcome[series_id], Direction.DOWN)
+            self.assertNotIn(series_id, engine._pending_outcome_inst_id)
+            engine.storage.close()
+
+    async def test_gives_up_after_max_attempts_but_keeps_stale_reading(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            engine._previous_outcome[series_id] = Direction.UP  # a known-good earlier reading
+
+            self._set_market(engine, series_id, "INST-A")
+            await engine._update_previous_outcomes()
+
+            self._set_market(engine, series_id, "INST-B")
+            engine.provider.check_settlement = lambda s, i: _resolved(None)  # never resolves
+
+            await engine._update_previous_outcomes()  # rollover attempt (1st)
+            for _ in range(engine.cfg.okx.settlement_poll_attempts):
+                engine._last_outcome_check[series_id] -= engine.cfg.okx.settlement_poll_interval_sec + 1
+                await engine._update_previous_outcomes()
+
+            self.assertNotIn(series_id, engine._pending_outcome_inst_id)  # gave up
+            self.assertEqual(engine._previous_outcome[series_id], Direction.UP)  # stale reading kept, not wiped
+            engine.storage.close()
+
+    async def test_open_due_trades_passes_previous_outcome_into_context(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            engine._previous_outcome[series_id] = Direction.DOWN
+
+            # _prime_entry_window() primes at a fixed remaining_sec=300 —
+            # the real market here needs LESS remaining than that so a
+            # checkpoint actually crosses (same pattern as the other
+            # _open_due_trades tests above in this file).
+            expiry_ts = time.time() + 60
+            engine.provider._active_markets[series_id] = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="INST-CURRENT",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.5, state="live",
+            )
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+
+            seen_ctx = []
+
+            async def _capture(ctx):
+                seen_ctx.append(ctx)
+                return None
+
+            engine.strategy_instances["breakout_retest"].evaluate = _capture
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            self.assertEqual(len(seen_ctx), 1)
+            self.assertEqual(seen_ctx[0].previous_outcome, Direction.DOWN)
+            engine.storage.close()
+
+
+def _resolved(value):
+    async def _inner():
+        return value
+    return _inner()
+
+
 if __name__ == "__main__":
     unittest.main()

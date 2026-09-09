@@ -16,7 +16,9 @@ from src.strategies.base import StrategyContext
 from src.strategies.fair_value_edge import (
     FairValueEdgeStrategy, basis_sigma_for_market, fair_probability_up, min_sigma_per_sec_from_pct,
 )
+from src.strategies.favorite_bias import FavoriteBiasStrategy
 from src.strategies.funding_skew import FundingSkewStrategy
+from src.strategies.prior_window_momentum import PriorWindowMomentumStrategy
 from src.strategies.volatility_breakout import VolatilityBreakoutStrategy
 
 
@@ -34,10 +36,14 @@ def make_market(
     )
 
 
-def make_ctx(price_history, orderbook=None, remaining_sec=200.0, window_min=7, market=None, funding_rate=None):
+def make_ctx(
+    price_history, orderbook=None, remaining_sec=200.0, window_min=7, market=None, funding_rate=None,
+    previous_outcome=None,
+):
     return StrategyContext(
         price_history=price_history, orderbook=orderbook, remaining_sec=remaining_sec,
         window_min=window_min, market=market or make_market(), funding_rate=funding_rate,
+        previous_outcome=previous_outcome,
     )
 
 
@@ -497,6 +503,77 @@ class BuildClientConfigTests(unittest.TestCase):
         cfg = build_client_config({"provider": "totally-not-a-provider"})
         self.assertIsNotNone(cfg)
         self.assertEqual(cfg.base_url, "https://router.requesty.ai/v1")
+
+
+class FavoriteBiasStrategyTests(unittest.IsolatedAsyncioTestCase):
+    """The deliberate opposite of fair_value_edge — see the module
+    docstring for the favorite-longshot-bias / crowd-momentum /
+    Resolution Rider ideas merged into this one rule."""
+
+    async def test_no_signal_below_threshold(self):
+        strategy = FavoriteBiasStrategy(config={"favorite_price_threshold": 0.70})
+        market = make_market(up_price=0.6)  # neither side reaches 0.70
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=market)))
+
+    async def test_up_favored_bets_up(self):
+        strategy = FavoriteBiasStrategy(config={"favorite_price_threshold": 0.70})
+        market = make_market(up_price=0.85)
+        signal = await strategy.evaluate(make_ctx([], market=market))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+        self.assertIn("0.85", signal.reason)
+
+    async def test_down_favored_bets_down(self):
+        strategy = FavoriteBiasStrategy(config={"favorite_price_threshold": 0.70})
+        market = make_market(up_price=0.10)  # down_price = 0.90
+        signal = await strategy.evaluate(make_ctx([], market=market))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)
+
+    async def test_exactly_at_threshold_still_signals(self):
+        strategy = FavoriteBiasStrategy(config={"favorite_price_threshold": 0.70})
+        market = make_market(up_price=0.70)
+        signal = await strategy.evaluate(make_ctx([], market=market))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+
+    async def test_no_signal_without_market_quote(self):
+        strategy = FavoriteBiasStrategy(config={})
+        market = make_market(up_price=None)
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=market)))
+
+    async def test_confidence_increases_toward_certainty(self):
+        strategy = FavoriteBiasStrategy(config={"favorite_price_threshold": 0.70})
+        near_threshold = await strategy.evaluate(make_ctx([], market=make_market(up_price=0.71)))
+        near_certain = await strategy.evaluate(make_ctx([], market=make_market(up_price=0.98)))
+        self.assertLess(near_threshold.confidence, near_certain.confidence)
+
+    async def test_custom_threshold_is_respected(self):
+        strategy = FavoriteBiasStrategy(config={"favorite_price_threshold": 0.55})
+        signal = await strategy.evaluate(make_ctx([], market=make_market(up_price=0.60)))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+
+
+class PriorWindowMomentumStrategyTests(unittest.IsolatedAsyncioTestCase):
+    """Trend-following baseline — see the module docstring for why this
+    exists as a deliberate control group, not a "real" strategy."""
+
+    async def test_no_signal_when_previous_outcome_unknown(self):
+        strategy = PriorWindowMomentumStrategy(config={})
+        self.assertIsNone(await strategy.evaluate(make_ctx([], previous_outcome=None)))
+
+    async def test_bets_up_after_up(self):
+        strategy = PriorWindowMomentumStrategy(config={})
+        signal = await strategy.evaluate(make_ctx([], previous_outcome=Direction.UP))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+
+    async def test_bets_down_after_down(self):
+        strategy = PriorWindowMomentumStrategy(config={})
+        signal = await strategy.evaluate(make_ctx([], previous_outcome=Direction.DOWN))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)
 
 
 if __name__ == "__main__":

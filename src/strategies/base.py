@@ -35,6 +35,12 @@ class StrategyContext:
     window_min: int                       # which configured entry checkpoint fired
     market: EventMarket                    # the event contract itself (px, strike, method, ...)
     funding_rate: Optional[float] = None   # current BTC perp funding rate, if available
+    # The winning Direction of the window immediately BEFORE this series'
+    # current one, if known — Engine._update_previous_outcomes() looks
+    # this up the moment a window rolls over, independent of whether any
+    # strategy actually held a position in it. None if not known yet
+    # (engine just started) or a lookup gave up after retrying.
+    previous_outcome: Optional[Direction] = None
 
 
 class BaseStrategy(ABC):

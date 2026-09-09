@@ -234,6 +234,40 @@ strategies:
       {"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,
       "reason":"<=6 слов"}
 
+  # Deliberate OPPOSITE of fair_value_edge: trusts the market's own price
+  # outright and just follows whichever side it already favors, instead of
+  # betting against it — see src/strategies/favorite_bias.py's module
+  # docstring for the "favorite-longshot bias" / "crowd-momentum
+  # confirmation" / "Resolution Rider" ideas this merges into one strategy.
+  # Two checkpoints cover both the ~3-minutes-out and the much later
+  # "Resolution Rider" variant with the SAME rule — no separate strategy
+  # or new timing mechanism needed for that, just another entry_windows_min
+  # value.
+  favorite_bias:
+    enabled: true
+    display_name: "H: Favorite Bias"
+    deposit_usd: 100
+    entry_windows_min: [3, 1]
+    # This strategy trades already-expensive contracts by design (price
+    # near favorite_price_threshold and up) — max_coefficient has to be
+    # generous or it would reject its own signals outright.
+    max_coefficient: 0.97
+    stake_fraction: 0.01
+    favorite_price_threshold: 0.70     # buy whichever side is priced >= this
+
+  # Genuine control-group baseline, not a "real" strategy — see
+  # src/strategies/prior_window_momentum.py's module docstring. If this
+  # beats the more sophisticated strategies, that's a real signal they
+  # aren't adding value; if it loses to a fair coin flip, that's equally
+  # informative (no serial correlation between independent windows).
+  prior_window_momentum:
+    enabled: true
+    display_name: "I: Prior Window Momentum"
+    deposit_usd: 100
+    entry_windows_min: [2]
+    max_coefficient: 0.85
+    stake_fraction: 0.01
+
 # --- Dashboard -----------------------------------------------------------------
 dashboard:
   mode: web                 # console | web | both | none

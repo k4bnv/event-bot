@@ -16,7 +16,7 @@ from typing import Deque, Optional
 from .config import AppConfig
 from .market_data import MarketDataProvider
 from .metrics import ComboStats, Leaderboard, build_combo_stats, build_leaderboard
-from .models import Trade
+from .models import Direction, Trade
 from .storage import Storage
 from .strategies import STRATEGY_REGISTRY, BaseStrategy, StrategyContext
 from .timing import EntryWindowManager
@@ -70,6 +70,16 @@ class Engine:
         self._last_settlement_check: dict[str, float] = {}
         self._last_snapshot_write = 0.0
         self._running = False
+
+        # Per-series (not per-strategy/per-trade) bookkeeping for
+        # prior_window_momentum — see _update_previous_outcomes(). Tracked
+        # independently of any strategy's open trades, since the whole
+        # point is to know a window's outcome even when nobody traded it.
+        self._last_inst_id: dict[str, str] = {}
+        self._previous_outcome: dict[str, Direction] = {}
+        self._pending_outcome_inst_id: dict[str, str] = {}
+        self._pending_outcome_attempts: dict[str, int] = {}
+        self._last_outcome_check: dict[str, float] = {}
 
         # Live activity feed for the dashboard's "Логи" tab — see
         # ActivityEvent's docstring. maxlen bounds memory for a
@@ -194,6 +204,11 @@ class Engine:
         self._close_strategies_soon(old_strategies)  # e.g. ai_prompt's old HTTP session
         self._settlement_attempts.clear()
         self._last_settlement_check.clear()
+        self._last_inst_id.clear()
+        self._previous_outcome.clear()
+        self._pending_outcome_inst_id.clear()
+        self._pending_outcome_attempts.clear()
+        self._last_outcome_check.clear()
         self._activity.clear()
         self._log_activity("*", "*", None, "no_signal", "База сброшена — журнал активности очищен")
         self.timing = EntryWindowManager()
@@ -295,10 +310,74 @@ class Engine:
 
     async def tick(self) -> None:
         await self.provider.refresh()
+        await self._update_previous_outcomes()
         await self._open_due_trades()
         await self._settle_expired_trades()
         self.timing.prune()
         self._maybe_persist()
+
+    # -- prior-window outcome tracking (prior_window_momentum) -----------------------
+    async def _update_previous_outcomes(self) -> None:
+        """The moment a series rolls over to a new instId, look up the
+        JUST-CLOSED window's settlement outcome — regardless of whether
+        any strategy actually held a position in it. _settle_expired_trades
+        only ever learns an outcome for a window some strategy traded;
+        prior_window_momentum needs to know every window's outcome to bet
+        on it, so this tracks it independently at the series level.
+
+        Retries (throttled by settlement_poll_interval_sec, capped at
+        settlement_poll_attempts — the same knobs _settle_expired_trades
+        uses, since it's the same "OKX hasn't published outcome yet"
+        situation) if the first lookup right at rollover comes back None.
+        Giving up just leaves the previous reading in place rather than
+        clearing it to None — a strategy checking two windows back is
+        better than one that suddenly stops betting at all because of one
+        transient lookup failure.
+        """
+        now = time.time()
+        poll_interval = self.cfg.okx.settlement_poll_interval_sec
+        active_markets = self.provider.active_markets()
+
+        for series_id in self.cfg.okx.series_ids:
+            market = active_markets.get(series_id)
+            if market is None or not market.inst_id:
+                continue
+
+            pending_inst_id = self._pending_outcome_inst_id.get(series_id)
+            if pending_inst_id is not None:
+                last_check = self._last_outcome_check.get(series_id, 0.0)
+                if now - last_check >= poll_interval:
+                    self._last_outcome_check[series_id] = now
+                    outcome = await self.provider.check_settlement(series_id, pending_inst_id)
+                    if outcome is not None:
+                        self._previous_outcome[series_id] = outcome
+                        self._pending_outcome_inst_id.pop(series_id, None)
+                        self._pending_outcome_attempts.pop(series_id, None)
+                    else:
+                        attempts = self._pending_outcome_attempts.get(series_id, 0) + 1
+                        self._pending_outcome_attempts[series_id] = attempts
+                        if attempts >= self.cfg.okx.settlement_poll_attempts:
+                            logger.warning(
+                                "prior_window_momentum: giving up on %s/%s's outcome after %d attempts — "
+                                "keeping the previous reading (if any) until the next rollover.",
+                                series_id, pending_inst_id, attempts,
+                            )
+                            self._pending_outcome_inst_id.pop(series_id, None)
+                            self._pending_outcome_attempts.pop(series_id, None)
+
+            last_inst_id = self._last_inst_id.get(series_id)
+            if last_inst_id is not None and last_inst_id != market.inst_id:
+                # Rollover detected this tick — try immediately (most
+                # settlements are already known by the time a new window
+                # opens), falling back to the retry loop above if not.
+                outcome = await self.provider.check_settlement(series_id, last_inst_id)
+                if outcome is not None:
+                    self._previous_outcome[series_id] = outcome
+                else:
+                    self._pending_outcome_inst_id[series_id] = last_inst_id
+                    self._pending_outcome_attempts[series_id] = 0
+                    self._last_outcome_check[series_id] = now
+            self._last_inst_id[series_id] = market.inst_id
 
     # -- opening trades ------------------------------------------------------------
     async def _open_due_trades(self) -> None:
@@ -328,6 +407,7 @@ class Engine:
                         orderbook=self.provider.btc_orderbook(),
                         remaining_sec=remaining, window_min=window_min,
                         market=market, funding_rate=self.provider.funding_rate(),
+                        previous_outcome=self._previous_outcome.get(series_id),
                     )
                     signal = await strategy.evaluate(ctx)
                     if signal is None:
