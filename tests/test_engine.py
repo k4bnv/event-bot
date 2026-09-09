@@ -915,6 +915,119 @@ class CheckpointFeatureLoggingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(engine.wallet_for("breakout_retest", 2).trades), 1)
             engine.storage.close()
 
+    async def test_dynamic_timing_already_positioned_logs_a_distinct_decision(self):
+        # A dynamic_timing strategy's evaluate() returning None because it
+        # already has an open trade in THIS market (already_open_this_market)
+        # is a completely different thing from genuinely finding no edge —
+        # mislabeling both as "no_signal" would quietly corrupt a real
+        # chunk of this strategy's negative examples for ML training.
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            cfg = make_config_with_adaptive_timing(tmp_path)
+            provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+            storage = Storage(tmp_path)
+            engine = Engine(cfg, provider, storage)
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "adaptive_timing")
+
+            # An earlier checkpoint already opened a trade in this exact market.
+            wallet = engine.wallet_for("adaptive_timing")
+            wallet.open_trade(Trade(
+                strategy="adaptive_timing", entry_window_min=5, series_id=series_id, inst_id="TEST-INST",
+                direction=Direction.UP, entry_price=0.3, stake_usd=5.0, contracts=16.6,
+                opened_ts=time.time(), expiry_ts=expiry_ts,
+            ))
+            engine.strategy_instances["adaptive_timing"].evaluate = lambda ctx: _resolved(None)
+            engine.strategy_instances["breakout_retest"].evaluate = lambda ctx: _resolved(None)
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            rows = engine.storage.get_checkpoint_features(strategy="adaptive_timing")
+            self.assertTrue(rows)
+            for row in rows:
+                self.assertEqual(row["decision"], "skipped_already_positioned")
+            engine.storage.close()
+
+    async def test_ordinary_strategy_with_an_open_trade_still_logs_plain_no_signal(self):
+        # Negative control: for an ORDINARY (non-dynamic_timing) strategy,
+        # already_open_this_market being True must never relabel the
+        # decision to "skipped_already_positioned" — that relabeling is
+        # only meaningful for a strategy that actually gates on this field
+        # (dynamic_timing). Forced directly onto the checkpoint's own
+        # wallet (bypassing the normal one-shot-per-checkpoint firing,
+        # which would never let this situation arise on its own) purely
+        # to exercise the engine's conditional in isolation.
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+
+            # Only "2" is reachable from this priming (see _prime_entry_window) —
+            # plant the trade directly on THAT checkpoint's own wallet.
+            wallet = engine.wallet_for("breakout_retest", 2)
+            wallet.open_trade(Trade(
+                strategy="breakout_retest", entry_window_min=2, series_id=series_id, inst_id="TEST-INST",
+                direction=Direction.UP, entry_price=0.3, stake_usd=5.0, contracts=16.6,
+                opened_ts=time.time(), expiry_ts=expiry_ts,
+            ))
+            engine.strategy_instances["breakout_retest"].evaluate = lambda ctx: _resolved(None)
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertTrue(rows)
+            for row in rows:
+                self.assertEqual(row["decision"], "no_signal")
+            engine.storage.close()
+
+    async def test_uses_this_strategys_own_sigma_floor_override_not_the_hardcoded_default(self):
+        # Flat price history -> zero realized volatility -> whatever
+        # sigma_horizon_pct gets logged is ENTIRELY the sigma floor, so a
+        # strategy-specific override must show up in the logged value —
+        # confirming _record_checkpoint_features reads it from s_cfg.extra
+        # rather than always DEFAULT_MIN_SIGMA_PCT_PER_MIN regardless of
+        # what that strategy's own evaluate() actually used.
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            engine.provider._price_history.clear()
+            for i in range(20):
+                engine.provider._price_history.append(PricePoint(ts=time.time() - (20 - i), price=50000.0))
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+
+            s_cfg = next(s for s in engine.cfg.strategies if s.name == "breakout_retest")
+            s_cfg.extra["min_sigma_pct_per_min"] = 5.0  # far above DEFAULT_MIN_SIGMA_PCT_PER_MIN (0.035)
+
+            engine.strategy_instances["breakout_retest"].evaluate = lambda ctx: _resolved(None)
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertEqual(len(rows), 1)
+            self.assertGreater(rows[0]["sigma_horizon_pct"], 1.0)  # only reachable via the override
+            engine.storage.close()
+
 
 def _resolved(value):
     async def _inner():

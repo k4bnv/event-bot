@@ -485,11 +485,22 @@ class Engine:
             points = list(ctx.price_history)
             now = points[-1].ts if points else time.time()
             spot = points[-1].price if points else None
+            # Read from THIS strategy's own extra config (falling back to
+            # the same defaults fair_value_edge/adaptive_timing/ai_prompt
+            # use) rather than always the raw default constants — so a
+            # strategy that overrides min_sigma_pct_per_min/
+            # unfixed_strike_basis_pct in config.yaml gets a logged
+            # z_score/base_prob/sigma_horizon_pct that matches what its OWN
+            # evaluate() actually computed, not a generic barrier model
+            # nobody's real decision used. Inert today (nothing in
+            # config.yaml overrides either yet) but correct if/when one does.
+            min_sigma_pct = s_cfg.extra.get("min_sigma_pct_per_min", DEFAULT_MIN_SIGMA_PCT_PER_MIN)
+            basis_pct = s_cfg.extra.get("unfixed_strike_basis_pct", DEFAULT_UNFIXED_STRIKE_BASIS_PCT)
             barrier = (
                 compute_barrier_stats(
                     points, spot, market.floor_strike, ctx.remaining_sec,
-                    min_sigma_per_sec=min_sigma_per_sec_from_pct(DEFAULT_MIN_SIGMA_PCT_PER_MIN),
-                    basis_sigma=basis_sigma_for_market(market, DEFAULT_UNFIXED_STRIKE_BASIS_PCT),
+                    min_sigma_per_sec=min_sigma_per_sec_from_pct(min_sigma_pct),
+                    basis_sigma=basis_sigma_for_market(market, basis_pct),
                 )
                 if spot is not None and market.floor_strike is not None else None
             )
@@ -576,9 +587,28 @@ class Engine:
                     )
                     signal = await strategy.evaluate(ctx)
                     if signal is None:
-                        logger.debug("%s: no signal at %dm-to-expiry for %s", s_cfg.name, window_min, series_id)
-                        self._log_activity(s_cfg.name, series_id, window_min, "no_signal", "нет сигнала")
-                        self._record_checkpoint_features(s_cfg, series_id, ctx, None, "no_signal")
+                        # A dynamic_timing strategy scanning a dense grid
+                        # returns None on EVERY checkpoint after the one
+                        # where it already committed to this market (see
+                        # already_open_this_market/adaptive_timing) — that's
+                        # a completely different thing from genuinely
+                        # finding no edge, and logging both as plain
+                        # "no_signal" would quietly mislabel a real chunk of
+                        # this strategy's negative examples for anyone
+                        # training on checkpoint_features later. Only
+                        # applies to dynamic_timing strategies: a normal
+                        # strategy already having an open trade in this
+                        # market (e.g. its "12 мин" checkpoint fired earlier)
+                        # says nothing about whether its "2 мин" checkpoint
+                        # — an independent bet with its own wallet — has a
+                        # real edge or not.
+                        if s_cfg.dynamic_timing and already_open_this_market:
+                            decision, message = "skipped_already_positioned", "уже есть позиция в этом рынке"
+                        else:
+                            decision, message = "no_signal", "нет сигнала"
+                        logger.debug("%s: %s at %dm-to-expiry for %s", s_cfg.name, message, window_min, series_id)
+                        self._log_activity(s_cfg.name, series_id, window_min, "no_signal", message)
+                        self._record_checkpoint_features(s_cfg, series_id, ctx, None, decision)
                         continue
 
                     inst_id = market.inst_id
