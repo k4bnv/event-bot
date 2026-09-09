@@ -196,3 +196,16 @@ class Trade:
         d["direction"] = self.direction.value
         d["status"] = self.status.value
         return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Trade":
+        """Inverse of to_dict() — rebuilds a Trade from a row Storage
+        handed back (e.g. get_trades()), converting direction/status back
+        from their plain string form. Used to restore closed-trade
+        history into a wallet at startup (see Engine._restore_or_create_wallet)
+        so winrate/PnL-per-combo stats don't reset to zero on every
+        redeploy the way they used to when only balance was restored."""
+        d = dict(d)
+        d["direction"] = Direction(d["direction"])
+        d["status"] = TradeStatus(d["status"])
+        return cls(**d)

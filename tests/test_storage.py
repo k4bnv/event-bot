@@ -50,6 +50,56 @@ class StorageResetTests(unittest.TestCase):
             self.assertEqual(len(storage.get_trades()), 1)
             storage.close()
 
+    def test_skip_ids_excludes_already_known_trades_from_the_sql_call(self):
+        # Engine passes the ids of trades it RESTORED from this same table
+        # (already safely persisted) so they're not resubmitted every
+        # tick forever just because they now live in wallet.trades too —
+        # verify the ACTUAL SQL statements executed exclude the skipped
+        # trade's row, not just that the end state happens to look the
+        # same (INSERT OR IGNORE would mask that either way). sqlite3.
+        # Connection's own methods can't be mocked (a C-level read-only
+        # attribute) — set_trace_callback is the supported hook for
+        # observing exactly what SQL text actually ran.
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            wallet = VirtualWallet(strategy="a", initial_balance=100.0)
+            old_trade = make_settled_trade("a")
+            wallet.open_trade(old_trade)
+            wallet.settle_trade(old_trade, won=True)
+            storage.append_closed_trades({"a": wallet})  # "old_trade" is now genuinely already in the DB
+
+            new_trade = make_settled_trade("a")
+            wallet.open_trade(new_trade)
+            wallet.settle_trade(new_trade, won=False)
+
+            executed = []
+            storage._conn.set_trace_callback(executed.append)
+            try:
+                storage.append_closed_trades({"a": wallet}, skip_ids={old_trade.id})
+            finally:
+                storage._conn.set_trace_callback(None)
+
+            insert_statements = [sql for sql in executed if "INSERT" in sql and "INTO trades" in sql]
+            self.assertEqual(len(insert_statements), 1)  # only new_trade's row was ever submitted
+            self.assertIn(new_trade.id, insert_statements[0])
+            self.assertNotIn(old_trade.id, insert_statements[0])
+
+            rows = storage.get_trades()
+            self.assertEqual({r["id"] for r in rows}, {old_trade.id, new_trade.id})  # both still there
+            storage.close()
+
+    def test_skip_ids_none_or_empty_behaves_like_before(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            wallet = VirtualWallet(strategy="a", initial_balance=100.0)
+            trade = make_settled_trade("a")
+            wallet.open_trade(trade)
+            wallet.settle_trade(trade, won=True)
+            storage.append_closed_trades({"a": wallet}, skip_ids=None)
+            storage.append_closed_trades({"a": wallet}, skip_ids=set())
+            self.assertEqual(len(storage.get_trades()), 1)
+            storage.close()
+
     def test_reset_wipes_everything(self):
         with TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp))

@@ -143,6 +143,82 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
             self.assertEqual(engine2.wallet_for("breakout_retest", 2).balance, 100.0)
             engine2.storage.close()
 
+    def test_second_engine_resumes_closed_trade_history_from_storage(self):
+        # Only balance/reserved used to survive a restart — wallet.trades
+        # started empty every time, so anything derived from it (this
+        # wallet's own W/L・winrate, build_combo_stats/the Leaderboard, the
+        # equity-curve chart) silently reset to zero right after a
+        # redeploy even though the persisted balance and the trades table
+        # both still remembered everything. That's the reported symptom
+        # this covers: "только сумма кошельков старые" (winrate resets,
+        # balance doesn't).
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine1 = self._make_engine(tmp_path)
+            wallet1 = engine1.wallet_for("breakout_retest", 12)
+            trade = Trade(
+                strategy="breakout_retest", entry_window_min=12, series_id="S", inst_id="I",
+                direction=Direction.UP, entry_price=0.4, stake_usd=10.0, contracts=25.0,
+                opened_ts=time.time(), expiry_ts=time.time(),
+            )
+            wallet1.open_trade(trade)
+            wallet1.settle_trade(trade, won=True)
+            engine1.storage.append_closed_trades(engine1.wallets)
+            engine1.storage.close()
+
+            storage2 = Storage(tmp_path)
+            cfg2 = make_config(tmp_path)
+            provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
+            engine2 = Engine(cfg2, provider2, storage2)
+
+            wallet2 = engine2.wallet_for("breakout_retest", 12)
+            closed = wallet2.closed_trades()
+            self.assertEqual(len(closed), 1)
+            self.assertEqual(closed[0].id, trade.id)
+            self.assertEqual(closed[0].status, TradeStatus.WON)
+            self.assertEqual(closed[0].pnl_usd, trade.pnl_usd)
+            # A different checkpoint's wallet is untouched by this trade.
+            self.assertEqual(engine2.wallet_for("breakout_retest", 2).trades, [])
+            engine2.storage.close()
+
+    def test_restored_trades_are_never_resubmitted_to_storage(self):
+        # The flip side of restoring history into wallet.trades: without
+        # skip_ids, append_closed_trades (called every tick) would
+        # pointlessly resubmit the ENTIRE restored history to the DB
+        # forever, just because it now also lives in wallet.trades.
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine1 = self._make_engine(tmp_path)
+            wallet1 = engine1.wallet_for("breakout_retest", 12)
+            trade = Trade(
+                strategy="breakout_retest", entry_window_min=12, series_id="S", inst_id="I",
+                direction=Direction.UP, entry_price=0.4, stake_usd=10.0, contracts=25.0,
+                opened_ts=time.time(), expiry_ts=time.time(),
+            )
+            wallet1.open_trade(trade)
+            wallet1.settle_trade(trade, won=True)
+            engine1.storage.append_closed_trades(engine1.wallets)
+            engine1.storage.close()
+
+            storage2 = Storage(tmp_path)
+            cfg2 = make_config(tmp_path)
+            provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
+            engine2 = Engine(cfg2, provider2, storage2)
+            self.assertIn(trade.id, engine2._restored_trade_ids)
+
+            # sqlite3.Connection's own methods can't be mocked (a C-level
+            # read-only attribute) — set_trace_callback is the supported
+            # hook for observing exactly what SQL text actually ran.
+            executed = []
+            engine2.storage._conn.set_trace_callback(executed.append)
+            try:
+                engine2._maybe_persist()
+            finally:
+                engine2.storage._conn.set_trace_callback(None)
+            trades_inserts = [sql for sql in executed if "INSERT" in sql and "INTO trades" in sql]
+            self.assertEqual(trades_inserts, [])  # never even attempted — nothing new to insert
+            engine2.storage.close()
+
     def test_reserved_capital_is_refunded_to_balance_on_restore(self):
         # A trade was still open (stake reserved, not yet settled) at the
         # moment of the last snapshot — that specific Trade object is gone
@@ -261,6 +337,37 @@ class DynamicTimingWalletTests(unittest.TestCase):
             engine2 = Engine(cfg2, provider2, storage2)
 
             self.assertEqual(engine2.wallet_for("adaptive_timing").balance, 123.0)
+            engine2.storage.close()
+
+    def test_trades_across_all_its_windows_are_restored_into_the_one_wallet(self):
+        # This wallet has no per-checkpoint split to restore into — its
+        # trades table history spans several different entry_window_min
+        # values (whichever the strategy happened to pick each time), and
+        # ALL of it belongs in this one shared wallet, not just one value.
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine1 = self._make_engine(tmp_path)
+            wallet1 = engine1.wallet_for("adaptive_timing")
+            for window_min in (5, 3):
+                trade = Trade(
+                    strategy="adaptive_timing", entry_window_min=window_min, series_id="S", inst_id=f"I{window_min}",
+                    direction=Direction.UP, entry_price=0.4, stake_usd=10.0, contracts=25.0,
+                    opened_ts=time.time(), expiry_ts=time.time(),
+                )
+                wallet1.open_trade(trade)
+                wallet1.settle_trade(trade, won=True)
+            engine1.storage.append_closed_trades(engine1.wallets)
+            engine1.storage.close()
+
+            storage2 = Storage(tmp_path)
+            cfg2 = make_config_with_adaptive_timing(tmp_path)
+            provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
+            engine2 = Engine(cfg2, provider2, storage2)
+
+            wallet2 = engine2.wallet_for("adaptive_timing")
+            closed = wallet2.closed_trades()
+            self.assertEqual(len(closed), 2)
+            self.assertEqual({t.entry_window_min for t in closed}, {5, 3})
             engine2.storage.close()
 
 

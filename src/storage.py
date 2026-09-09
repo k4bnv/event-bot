@@ -189,14 +189,25 @@ class Storage:
         self._conn.close()
 
     # -- writes ----------------------------------------------------------------
-    def append_closed_trades(self, wallets: dict[str, VirtualWallet]) -> None:
+    def append_closed_trades(self, wallets: dict[str, VirtualWallet], skip_ids: Optional[set] = None) -> None:
         """Insert any newly-closed trades (won/lost/unresolved). Dedup is
         just the primary key — INSERT OR IGNORE silently skips a trade
-        already written in an earlier tick."""
+        already written in an earlier tick.
+
+        `skip_ids` (Engine passes the ids of trades it restored FROM this
+        same table at startup — see _load_closed_trades_for_wallet) skips
+        those before even building a row for them: this runs every tick,
+        and without it, every one of a wallet's restored historical trades
+        would get pointlessly re-submitted to INSERT OR IGNORE forever —
+        harmless (still a correct no-op) but a cost that only grows as
+        history accumulates, for trades already known to be in this exact
+        table."""
         rows = []
         for wallet in wallets.values():
             for trade in wallet.trades:
                 if trade.closed_ts is None:
+                    continue
+                if skip_ids is not None and trade.id in skip_ids:
                     continue
                 d = trade.to_dict()
                 rows.append(tuple(d.get(f) for f in TRADE_FIELDS))

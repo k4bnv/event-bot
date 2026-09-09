@@ -72,6 +72,12 @@ class Engine:
 
         self.wallets: dict[str, VirtualWallet] = {}
         self.strategy_instances: dict[str, BaseStrategy] = {}
+        # Ids of trades restored into wallet.trades from the durable
+        # trades table at startup (see _load_closed_trades_for_wallet) —
+        # append_closed_trades() is called every tick and skips these, so
+        # a wallet's whole restored history isn't pointlessly resubmitted
+        # to the DB forever just because it now lives in wallet.trades too.
+        self._restored_trade_ids: set[str] = set()
         self._settlement_attempts: dict[str, int] = {}
         self._last_settlement_check: dict[str, float] = {}
         self._last_snapshot_write = 0.0
@@ -135,6 +141,7 @@ class Engine:
         # self.wallets forever after a reset() rebuild.
         self.wallets.clear()
         self.strategy_instances.clear()
+        self._restored_trade_ids.clear()
         # One query up front rather than one per (strategy, checkpoint) —
         # cheap, and keeps _build_wallets_and_strategies() the single place
         # that decides "restore vs fresh start" for every wallet at once.
@@ -175,16 +182,23 @@ class Engine:
                 s_cfg.name, s_cfg.deposit_usd, s_cfg.entry_windows_min, s_cfg.max_coefficient, s_cfg.stake_fraction,
             )
 
-    @staticmethod
-    def _restore_or_create_wallet(s_cfg, window_min: Optional[int], saved: Optional[dict]) -> VirtualWallet:
+    def _restore_or_create_wallet(self, s_cfg, window_min: Optional[int], saved: Optional[dict]) -> VirtualWallet:
         """A fresh VirtualWallet(deposit_usd) for this ONE checkpoint if
         `saved` is None (first-ever launch, a checkpoint just added to
         entry_windows_min, or one just reset) — otherwise resumes the
         balance write_snapshot() persisted for it, so a redeploy/crash/
         restart doesn't silently reset every checkpoint back to its
-        starting deposit while the Analytics tab (backed by the
-        separately, every-tick-persisted trades table) keeps remembering
-        the full history.
+        starting deposit.
+
+        Either way, ALSO restores this wallet's closed-trade history from
+        the durable trades table (see _load_closed_trades_for_wallet) —
+        without that, wallet.trades would start empty every restart, and
+        everything derived from it (this wallet's own W/L・winrate on the
+        dashboard, build_combo_stats/the Leaderboard, the Analytics tab's
+        equity-curve chart) would silently reset to zero right after a
+        redeploy even though the persisted balance/trades table both still
+        remember everything — exactly the "только сумма кошельков старые"
+        symptom reported after a redeploy.
 
         initial_balance is restored too (not re-read from config) so
         net_pnl/equity keep meaning "profit since this checkpoint's actual
@@ -201,19 +215,43 @@ class Engine:
         VirtualWallet.mark_unresolved() already uses for a settlement that
         times out."""
         if saved is None:
-            return VirtualWallet(strategy=s_cfg.name, window_min=window_min, initial_balance=s_cfg.deposit_usd)
-        wallet = VirtualWallet(
-            strategy=s_cfg.name, window_min=window_min, initial_balance=saved["initial_balance"],
-        )
-        wallet.balance = saved["balance"] + saved["reserved"]
-        if saved["reserved"]:
-            window_label = f"{window_min} мин" if window_min is not None else "динамический тайминг"
-            logger.warning(
-                "Strategy '%s' (%s): restarted with $%.2f still reserved in-flight at the last "
-                "snapshot — refunded to balance (its open trade(s) can't be resumed across a restart).",
-                s_cfg.name, window_label, saved["reserved"],
+            wallet = VirtualWallet(strategy=s_cfg.name, window_min=window_min, initial_balance=s_cfg.deposit_usd)
+        else:
+            wallet = VirtualWallet(
+                strategy=s_cfg.name, window_min=window_min, initial_balance=saved["initial_balance"],
             )
+            wallet.balance = saved["balance"] + saved["reserved"]
+            if saved["reserved"]:
+                window_label = f"{window_min} мин" if window_min is not None else "динамический тайминг"
+                logger.warning(
+                    "Strategy '%s' (%s): restarted with $%.2f still reserved in-flight at the last "
+                    "snapshot — refunded to balance (its open trade(s) can't be resumed across a restart).",
+                    s_cfg.name, window_label, saved["reserved"],
+                )
+        wallet.trades = self._load_closed_trades_for_wallet(s_cfg.name, window_min)
         return wallet
+
+    def _load_closed_trades_for_wallet(self, strategy_name: str, window_min: Optional[int]) -> list[Trade]:
+        """This wallet's CLOSED (won/lost/unresolved) trade history from
+        the durable trades table, rebuilt into real Trade objects — see
+        _restore_or_create_wallet for why. Still-open trades at the moment
+        of a crash/restart are never in the trades table in the first
+        place (only append_closed_trades' closed_ts-is-not-None rows ever
+        get persisted) and aren't recoverable anyway — same as before,
+        their stake is refunded to balance instead of restored as
+        reserved.
+
+        A dynamic_timing strategy's ONE shared wallet (window_min=None
+        here) restores trades across EVERY entry_window_min it's ever
+        actually fired at — that IS all of its history, since it has no
+        per-checkpoint wallet split to filter by. A normal wallet restores
+        only the trades that landed on its own exact window_min."""
+        rows = self.storage.get_trades(strategy=strategy_name, limit=None)
+        if window_min is not None:
+            rows = [r for r in rows if r["entry_window_min"] == window_min]
+        trades = [Trade.from_dict(r) for r in rows]
+        self._restored_trade_ids.update(t.id for t in trades)
+        return trades
 
     # -- lifecycle ---------------------------------------------------------------
     def stop(self) -> None:
@@ -817,7 +855,7 @@ class Engine:
 
     # -- persistence ---------------------------------------------------------------
     def _maybe_persist(self) -> None:
-        self.storage.append_closed_trades(self.wallets)
+        self.storage.append_closed_trades(self.wallets, skip_ids=self._restored_trade_ids)
         now = time.time()
         if now - self._last_snapshot_write >= self.cfg.storage.snapshot_every_sec:
             self.storage.write_snapshot(self.wallets)
