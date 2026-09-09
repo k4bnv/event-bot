@@ -11,7 +11,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from run import _detect_impulses, _lag_percentile, _measure_reaction_lag, _measure_upprice_reaction_lag
+from run import (
+    _detect_impulses, _lag_percentile, _measure_reaction_lag, _measure_upprice_reaction_lag,
+    _rows_to_series, _seconds_since_rollover,
+)
 
 
 class LagPercentileTests(unittest.TestCase):
@@ -187,6 +190,50 @@ class MeasureUppriceReactionLagTests(unittest.TestCase):
     def test_empty_impulses_returns_empty(self):
         reactor = self._upprice_series(120, jump_at=54)
         self.assertEqual(_measure_upprice_reaction_lag([], reactor, 20, 0.02), [])
+
+
+class RowsToSeriesTests(unittest.TestCase):
+    """Covers _rows_to_series, which parses --check-leadlag-internal's saved
+    CSV rows back into the series shapes the analyzer needs — the only
+    thing standing between --analyze-leadlag-internal and a real file."""
+
+    def test_parses_valid_rows(self):
+        rows = [
+            {"ts": "1.0", "spot_price": "100.0", "up_price": "0.50", "inst_id": "A"},
+            {"ts": "2.0", "spot_price": "101.0", "up_price": "0.51", "inst_id": "A"},
+        ]
+        spot, up = _rows_to_series(rows)
+        self.assertEqual(spot, [(1.0, 100.0), (2.0, 101.0)])
+        self.assertEqual(up, [(1.0, 0.50, "A"), (2.0, 0.51, "A")])
+
+    def test_skips_missing_or_unparseable_fields_independently(self):
+        rows = [
+            {"ts": "1.0", "spot_price": "", "up_price": "0.50", "inst_id": "A"},       # spot missing
+            {"ts": "2.0", "spot_price": "100.0", "up_price": "", "inst_id": "A"},      # up_price missing
+            {"ts": "bad", "spot_price": "100.0", "up_price": "0.50", "inst_id": "A"},  # bad ts, row dropped
+            {"ts": "4.0", "spot_price": "100.0", "up_price": "0.50", "inst_id": ""},   # empty inst_id
+        ]
+        spot, up = _rows_to_series(rows)
+        self.assertEqual(spot, [(2.0, 100.0), (4.0, 100.0)])
+        self.assertEqual(up, [(1.0, 0.50, "A")])
+
+    def test_empty_input(self):
+        self.assertEqual(_rows_to_series([]), ([], []))
+
+
+class SecondsSinceRolloverTests(unittest.TestCase):
+    def test_measures_time_since_first_sample_of_this_instrument(self):
+        up_series = [(10.0, 0.5, "A"), (12.0, 0.5, "A"), (15.0, 0.5, "B"), (18.0, 0.5, "B")]
+        self.assertEqual(_seconds_since_rollover(12.0, up_series, "A"), 2.0)
+        self.assertEqual(_seconds_since_rollover(18.0, up_series, "B"), 3.0)
+
+    def test_none_when_ts_precedes_any_sample_of_that_instrument(self):
+        up_series = [(10.0, 0.5, "A")]
+        self.assertIsNone(_seconds_since_rollover(5.0, up_series, "A"))
+
+    def test_none_for_an_instrument_never_seen(self):
+        up_series = [(10.0, 0.5, "A")]
+        self.assertIsNone(_seconds_since_rollover(12.0, up_series, "Z"))
 
 
 if __name__ == "__main__":

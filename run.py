@@ -1096,6 +1096,147 @@ async def check_internal_leadlag(
             print(f"\n(report saved to {report_path})")
 
 
+def _rows_to_series(
+    rows: list[dict],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float, str]]]:
+    """Parse the CSV rows a --check-leadlag-internal run wrote (columns ts,
+    spot_price, up_price, inst_id — all strings, any of them possibly empty
+    if that particular fetch failed at the time) back into the
+    (spot_series, up_series) shapes _detect_impulses and
+    _measure_upprice_reaction_lag expect. A row with an unparseable ts is
+    dropped entirely (it's not usable for either series); spot_price and
+    up_price/inst_id are otherwise independent — a row missing one can
+    still contribute the other."""
+    spot: list[tuple[float, float]] = []
+    up: list[tuple[float, float, str]] = []
+    for row in rows:
+        try:
+            ts = float(row.get("ts"))
+        except (TypeError, ValueError):
+            continue
+
+        sp = row.get("spot_price")
+        if sp not in (None, ""):
+            try:
+                spot.append((ts, float(sp)))
+            except (TypeError, ValueError):
+                pass
+
+        upp, inst = row.get("up_price"), row.get("inst_id")
+        if upp not in (None, "") and inst:
+            try:
+                up.append((ts, float(upp), inst))
+            except (TypeError, ValueError):
+                pass
+    return spot, up
+
+
+def _seconds_since_rollover(
+    ts: float, up_series: list[tuple[float, float, str]], inst_id: str,
+) -> Optional[float]:
+    """How long `inst_id` had already been the live instrument at time
+    `ts` — ts minus the first up_series sample we recorded for it at or
+    before ts. None if we never saw an earlier sample of this inst_id
+    (most commonly: it's the very first instrument in the recording, so we
+    genuinely don't know when its own window started)."""
+    first_ts = None
+    for t, _, inst in up_series:
+        if inst != inst_id:
+            continue
+        if t > ts:
+            break
+        if first_ts is None:
+            first_ts = t
+    return (ts - first_ts) if first_ts is not None else None
+
+
+def _latest_leadlag_csv(cfg) -> Optional[Path]:
+    data_dir = Path(cfg.storage.data_dir)
+    candidates = sorted(data_dir.glob("leadlag_internal_samples_*.csv"))  # filenames sort chronologically
+    return candidates[-1] if candidates else None
+
+
+def analyze_internal_leadlag(
+    csv_path: Path, impulse_threshold_pct: float = 0.03, window_sec: float = 10.0,
+    lag_horizon_sec: float = 20.0, upprice_react_threshold: float = 0.02, tail_threshold_sec: float = 3.0,
+) -> None:
+    """Utility mode: re-analyze an already-collected --check-leadlag-internal
+    CSV for WHEN the slow-reaction tail happens, instead of just the
+    min/median/p75/mean/max summary --check-leadlag-internal itself prints.
+    Pure offline analysis — no network calls, no API keys, re-reads the
+    same raw samples file. The question this answers: is the slow tail
+    predictable (clusters with bigger impulses, or with how long the
+    current contract has been live) or does it look basically random? A
+    predictable tail is something a live strategy could plausibly act on;
+    a random one means you'd only ever know a reaction was "slow" in
+    hindsight, after the window to act on it already closed.
+    """
+    with open(csv_path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    spot_series, up_series = _rows_to_series(rows)
+    print(f"Loaded {csv_path} — {len(spot_series)} spot samples, {len(up_series)} up_price samples.\n")
+    if len(spot_series) < 10 or len(up_series) < 10:
+        print("Not enough parsable rows to analyze.")
+        return
+
+    impulses = _detect_impulses(spot_series, impulse_threshold_pct, window_sec, cooldown_sec=window_sec)
+    results = _measure_upprice_reaction_lag(impulses, up_series, lag_horizon_sec, upprice_react_threshold)
+
+    records = []
+    for imp, res in zip(impulses, results):
+        if res["excluded"] or res["lag"] is None:
+            continue
+        base_inst = None
+        for t, _, inst in up_series:
+            if t <= imp["end_ts"]:
+                base_inst = inst
+            else:
+                break
+        since_rollover = _seconds_since_rollover(imp["end_ts"], up_series, base_inst) if base_inst else None
+        records.append({
+            "ts": imp["end_ts"], "direction": imp["direction"],
+            "move_pct": abs(imp["move_pct"]), "lag": res["lag"], "since_rollover": since_rollover,
+        })
+
+    if not records:
+        print("No reacted (non-excluded) impulses in this file to analyze — nothing to break down.")
+        return
+
+    def tail_rate(subset: list[dict]) -> str:
+        if not subset:
+            return "no samples"
+        n_tail = sum(1 for r in subset if r["lag"] >= tail_threshold_sec)
+        return f"{n_tail}/{len(subset)} ({n_tail / len(subset) * 100:.0f}%) tail (>= {tail_threshold_sec:.1f}s)"
+
+    moves_sorted = sorted(r["move_pct"] for r in records)
+    move_median = moves_sorted[len(moves_sorted) // 2]
+    print(f"{len(records)} reacted impulses total.\n")
+    print(f"By impulse size (median move_pct={move_median:.3f}%):")
+    print(f"  smaller moves: {tail_rate([r for r in records if r['move_pct'] < move_median])}")
+    print(f"  larger  moves: {tail_rate([r for r in records if r['move_pct'] >= move_median])}")
+
+    since_vals = sorted(r["since_rollover"] for r in records if r["since_rollover"] is not None)
+    if since_vals:
+        since_median = since_vals[len(since_vals) // 2]
+        with_since = [r for r in records if r["since_rollover"] is not None]
+        print(f"\nBy time already spent on the current contract (median={since_median:.0f}s; "
+              f"{len(records) - len(with_since)} impulse(s) excluded — their contract's own start "
+              f"wasn't captured in this recording):")
+        print(f"  earlier in the contract's life: "
+              f"{tail_rate([r for r in with_since if r['since_rollover'] < since_median])}")
+        print(f"  later in the contract's life:   "
+              f"{tail_rate([r for r in with_since if r['since_rollover'] >= since_median])}")
+    else:
+        print("\nNo time-since-rollover data available (every reacted impulse's contract was "
+              "already live at the very start of this recording).")
+
+    print(f"\nAll {len(records)} reacted impulses, slowest first (eyeball for clustering by time of day):")
+    for r in sorted(records, key=lambda r: -r["lag"]):
+        t = time.strftime("%H:%M:%S", time.localtime(r["ts"]))
+        since_str = f"{r['since_rollover']:.0f}s into its contract" if r["since_rollover"] is not None else "contract start unknown"
+        print(f"  {t}  {r['direction'].upper():5s} move={r['move_pct']:.3f}%  lag={r['lag']:5.1f}s  {since_str}")
+
+
 async def run_bot(cfg) -> None:
     storage = Storage(cfg.storage.data_dir)
 
@@ -1271,6 +1412,23 @@ def main() -> None:
              "every poll tick like the ticker fetches are)",
     )
     parser.add_argument(
+        "--analyze-leadlag-internal", action="store_true",
+        help="re-analyze an already-collected --check-leadlag-internal CSV for WHEN the "
+             "slow-reaction tail happens (impulse size, time since the contract's own "
+             "rollover) instead of just the summary numbers — pure offline analysis, no "
+             "network calls, no API keys needed",
+    )
+    parser.add_argument(
+        "--leadlag-csv", metavar="PATH",
+        help="which leadlag_internal_samples_*.csv to analyze for --analyze-leadlag-internal "
+             "(default: the newest one in the data dir)",
+    )
+    parser.add_argument(
+        "--tail-threshold-sec", type=float, default=3.0, metavar="SEC",
+        help="lag (seconds) at/above which a reaction counts as 'tail' rather than fast, for "
+             "--analyze-leadlag-internal (default: 3.0, matching the live diagnostics' default)",
+    )
+    parser.add_argument(
         "--reset-data", action="store_true",
         help="wipe data/bot.db (all strategies), then exit "
              "(equivalent to the web dashboard's Reset DB button, for console-mode users)",
@@ -1319,6 +1477,21 @@ def main() -> None:
             lag_horizon_sec=args.lag_horizon_sec, upprice_react_threshold=args.upprice_react_threshold,
             series_id=args.series_id, resolve_interval_sec=args.resolve_interval_sec,
         ))
+        return
+
+    if args.analyze_leadlag_internal:
+        csv_path = Path(args.leadlag_csv) if args.leadlag_csv else _latest_leadlag_csv(cfg)
+        if not csv_path or not csv_path.exists():
+            print(
+                "No leadlag_internal_samples_*.csv found in the data dir — run "
+                "--check-leadlag-internal first, or pass --leadlag-csv PATH.", file=sys.stderr,
+            )
+            sys.exit(1)
+        analyze_internal_leadlag(
+            csv_path, impulse_threshold_pct=args.impulse_threshold_pct, window_sec=args.window_sec,
+            lag_horizon_sec=args.lag_horizon_sec, upprice_react_threshold=args.upprice_react_threshold,
+            tail_threshold_sec=args.tail_threshold_sec,
+        )
         return
 
     if args.reset_data:
