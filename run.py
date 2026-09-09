@@ -77,20 +77,68 @@ async def discover_series(cfg) -> None:
         print("\nCopy the seriesId values you want into config.yaml -> okx.series_ids\n")
 
 
-async def check_liquidity(cfg) -> None:
+def _simulate_market_fill(levels: list, budget_usd: float):
+    """Walk order-book price levels (each [priceStr, sizeStr, ...], BEST
+    PRICE FIRST — the order OKX's /market/books already returns them in)
+    simulating a market order that spends up to budget_usd. Each contract
+    at a level costs `price` (the 0.01-0.99 probability IS the per-contract
+    USDT cost), so a level of `size` contracts costs `price * size` USDT.
+
+    Returns (vwap_price, contracts_filled, usd_spent, fully_filled).
+    fully_filled=False means the visible book didn't have enough depth to
+    absorb budget_usd at all — a real order that size would walk even
+    deeper / partially fail, i.e. worse than what's computed here."""
+    contracts, spent = 0.0, 0.0
+    for level in levels:
+        try:
+            price, size = float(level[0]), float(level[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if price <= 0 or size <= 0:
+            continue
+        remaining_budget = budget_usd - spent
+        if remaining_budget <= 0:
+            break
+        level_cost = price * size
+        if level_cost <= remaining_budget:
+            contracts += size
+            spent += level_cost
+        else:
+            take = remaining_budget / price
+            contracts += take
+            spent += remaining_budget
+            break
+    fully_filled = spent >= budget_usd - 1e-6
+    vwap = (spent / contracts) if contracts > 0 else None
+    return vwap, contracts, spent, fully_filled
+
+
+async def check_liquidity(cfg, test_stake_usd: float = 20.0) -> None:
     """Utility mode: for every live Event Contract instrument currently open
-    on the configured series, print its real ticker (last/bidPx/askPx) and
-    top-of-book size, plus the computed bid/ask spread as both an absolute
-    (0.01-0.99 scale) and a percentage-of-mid figure.
+    on the configured series, print its real ticker (last/bidPx/askPx),
+    the computed bid/ask spread, AND a simulated market-order fill for a
+    `test_stake_usd`-sized order walking the real order book depth —
+    a genuine VWAP-based slippage estimate, not just a top-of-book number.
 
     Why this exists: the strategy engine simulates a fill at `last` (or the
     bid/ask midpoint as a fallback — see market_data.py's
     `_fetch_event_price`), with NO slippage/spread cost applied. On a thin
-    market that midpoint can be well away from what a real market order
-    would actually fill at. This command answers "how thin is it right
-    now?" using real, live OKX quotes — no simulation, no auth needed for
-    the ticker/books calls themselves (unlike the series/markets discovery
-    calls, which do need a signed request — see okx_client.py).
+    market that can be well away from what a real market order would
+    actually fill at. OKX's v5 API has no dry-run/"test order" endpoint
+    (unlike e.g. Binance) — there's no way to ask the exchange itself "what
+    would this order fill at" without actually placing one — so this
+    command reconstructs the answer from the real, live, PUBLIC order book
+    instead. No auth needed for ticker/books themselves (unlike the
+    series/markets discovery calls, which do need a signed request — see
+    okx_client.py), and no order is ever placed — zero execution risk.
+
+    Caveat: the book/ticker only clearly represents the UP/YES side's own
+    bid-ask (see models.py EventMarket — OKX gives one px per instrument,
+    not separate UP/DOWN books). The DOWN simulation below walks the BID
+    side as an approximation (going DOWN ~= selling into the UP book's
+    bids, i.e. paying `1 - vwap_bid`) — OKX doesn't publicly document the
+    exact internal matching for the non-primary side, so treat the DOWN
+    number as directional, not exact.
     """
     if not (cfg.okx.api_key and cfg.okx.api_secret and cfg.okx.api_passphrase):
         print(
@@ -130,12 +178,13 @@ async def check_liquidity(cfg) -> None:
 
             try:
                 ticker = await client.get_ticker(inst_id)
-                book = await client.get_orderbook(inst_id, sz=5)
+                book = await client.get_orderbook(inst_id, sz=20)
             except Exception as exc:
                 print(f"{series_id} ({inst_id}): failed to fetch ticker/book ({exc})")
                 continue
 
             print(f"\n{series_id}  ->  {inst_id}")
+            last = None
             if not ticker:
                 print("  ticker: <empty — no live quote>")
             else:
@@ -148,21 +197,47 @@ async def check_liquidity(cfg) -> None:
                     mid = (bid_f + ask_f) / 2
                     spread_abs = ask_f - bid_f
                     spread_pct = (spread_abs / mid * 100) if mid else float("nan")
-                    print(f"  spread: {spread_abs:.4f} absolute  ({spread_pct:.1f}% of mid {mid:.4f})")
-                    print(
-                        "  -> the engine would have simulated this fill at "
-                        f"last={last} (or mid={mid:.4f} if no trade yet) — "
-                        f"a REAL market buy would fill closer to ask={ask}, "
-                        f"a real sell closer to bid={bid}."
-                    )
+                    print(f"  top-of-book spread: {spread_abs:.4f} absolute  ({spread_pct:.1f}% of mid {mid:.4f})")
                 except (TypeError, ValueError):
                     pass
+
             if not book:
-                print("  book: <empty>")
+                print("  book: <empty> — can't simulate a fill")
+                continue
+
+            b = book[0]
+            asks, bids = b.get("asks", []), b.get("bids", [])
+            print(f"  book depth: {len(bids)} bid levels / {len(asks)} ask levels")
+
+            up_vwap, up_contracts, up_spent, up_full = _simulate_market_fill(asks, test_stake_usd)
+            down_vwap, down_contracts, down_spent, down_full = _simulate_market_fill(bids, test_stake_usd)
+
+            print(f"  simulated ${test_stake_usd:.2f} market BUY UP:")
+            if up_vwap is None:
+                print("    <no ask liquidity at all>")
             else:
-                b = book[0]
-                print(f"  top bids: {b.get('bids', [])[:5]}")
-                print(f"  top asks: {b.get('asks', [])[:5]}")
+                print(f"    vwap_fill={up_vwap:.4f}  contracts={up_contracts:.2f}  "
+                      f"spent=${up_spent:.2f}  {'(fully filled)' if up_full else '(BOOK RAN OUT — worse in reality)'}")
+                try:
+                    engine_price = float(last) if last not in (None, "") else float(asks[0][0])
+                    slippage_pct = (up_vwap - engine_price) / engine_price * 100
+                    print(f"    vs engine's simulated entry ({engine_price:.4f}): {slippage_pct:+.1f}% slippage")
+                except (TypeError, ValueError, IndexError):
+                    pass
+
+            print(f"  simulated ${test_stake_usd:.2f} market BUY DOWN (approx. — see caveat in docstring):")
+            if down_vwap is None:
+                print("    <no bid liquidity at all>")
+            else:
+                down_cost = 1 - down_vwap
+                print(f"    implied_fill={down_cost:.4f}  contracts={down_contracts:.2f}  "
+                      f"spent=${down_spent:.2f}  {'(fully filled)' if down_full else '(BOOK RAN OUT — worse in reality)'}")
+                try:
+                    engine_price = round(1 - float(last), 4) if last not in (None, "") else round(1 - float(bids[0][0]), 4)
+                    slippage_pct = (down_cost - engine_price) / engine_price * 100
+                    print(f"    vs engine's simulated entry ({engine_price:.4f}): {slippage_pct:+.1f}% slippage")
+                except (TypeError, ValueError, IndexError, ZeroDivisionError):
+                    pass
 
 
 async def run_bot(cfg) -> None:
@@ -257,9 +332,15 @@ def main() -> None:
     )
     parser.add_argument(
         "--check-liquidity", action="store_true",
-        help="print real ticker + top-of-book bid/ask/spread for each series' current "
-             "live instrument and exit — shows how far a real market-order fill would be "
-             "from the last/mid price the engine simulates trades at",
+        help="print real ticker + a simulated market-order fill (walking the real order "
+             "book, no order ever placed) for each series' current live instrument, and "
+             "exit — shows how far a real fill would be from the last/mid price the "
+             "engine simulates trades at",
+    )
+    parser.add_argument(
+        "--test-stake", type=float, default=20.0, metavar="USD",
+        help="order size (USDT) to simulate in --check-liquidity (default: 20, "
+             "roughly matching a typical live stake)",
     )
     parser.add_argument(
         "--reset-data", action="store_true",
@@ -281,7 +362,7 @@ def main() -> None:
         return
 
     if args.check_liquidity:
-        asyncio.run(check_liquidity(cfg))
+        asyncio.run(check_liquidity(cfg, test_stake_usd=args.test_stake))
         return
 
     if args.reset_data:
