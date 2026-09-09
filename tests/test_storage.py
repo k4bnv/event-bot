@@ -160,6 +160,80 @@ class StorageResetTests(unittest.TestCase):
             storage.close()
 
 
+class PerCheckpointWalletsTests(unittest.TestCase):
+    """Covers the wallets table's move from one-row-per-strategy to
+    one-row-per-(strategy, window_min) — see Engine._wallet_key and
+    storage.py's _migrate_wallets_table."""
+
+    def test_two_checkpoints_of_the_same_strategy_persist_independently(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            w12 = VirtualWallet(strategy="breakout_retest", window_min=12, initial_balance=100.0)
+            w2 = VirtualWallet(strategy="breakout_retest", window_min=2, initial_balance=100.0)
+            w12.balance = 142.5
+            w2.balance = 61.0
+            storage.write_snapshot({"breakout_retest:12": w12, "breakout_retest:2": w2})
+
+            loaded = storage.load_wallets()
+            self.assertEqual(loaded["breakout_retest:12"]["balance"], 142.5)
+            self.assertEqual(loaded["breakout_retest:2"]["balance"], 61.0)
+            storage.close()
+
+    def test_write_snapshot_updates_in_place_on_conflict(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            w = VirtualWallet(strategy="a", window_min=2, initial_balance=100.0)
+            storage.write_snapshot({"a:2": w})
+            w.balance = 88.0
+            storage.write_snapshot({"a:2": w})  # same id again -> update, not a duplicate row
+
+            loaded = storage.load_wallets()
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded["a:2"]["balance"], 88.0)
+            storage.close()
+
+    def test_migrates_old_per_strategy_schema_without_crashing(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bot.db"
+            # Build the OLD schema by hand, as if this were a DB from before
+            # the per-checkpoint split.
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                "CREATE TABLE wallets (strategy TEXT PRIMARY KEY, initial_balance REAL, "
+                "balance REAL, reserved REAL, updated_at REAL)"
+            )
+            conn.execute("INSERT INTO wallets VALUES ('breakout_retest', 100.0, 55.0, 0.0, 123.0)")
+            conn.commit()
+            conn.close()
+
+            storage = Storage(Path(tmp))  # must not raise on the old schema
+
+            # Old table renamed aside, not deleted, and not read as new-schema data.
+            self.assertEqual(storage.load_wallets(), {})
+            old_rows = storage._conn.execute(
+                "SELECT * FROM wallets_legacy_pre_checkpoint_split"
+            ).fetchall()
+            self.assertEqual(len(old_rows), 1)
+
+            # New-schema writes work fine on the now-migrated DB.
+            w = VirtualWallet(strategy="breakout_retest", window_min=12, initial_balance=100.0)
+            storage.write_snapshot({"breakout_retest:12": w})
+            self.assertEqual(storage.load_wallets()["breakout_retest:12"]["balance"], 100.0)
+            storage.close()
+
+    def test_fresh_database_needs_no_migration(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))  # no pre-existing wallets table at all
+            self.assertEqual(storage.load_wallets(), {})
+            tables = {
+                row[0] for row in
+                storage._conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+            self.assertNotIn("wallets_legacy_pre_checkpoint_split", tables)
+            storage.close()
+
+
 def make_feature_row(id_="f1", strategy="a", ts=1000.0, decision="no_signal", **overrides) -> dict:
     row = {f: None for f in FEATURE_FIELDS}
     row.update({"id": id_, "strategy": strategy, "ts": ts, "decision": decision})

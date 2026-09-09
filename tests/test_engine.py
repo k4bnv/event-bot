@@ -47,16 +47,21 @@ class EngineResetStrategyTests(unittest.TestCase):
     def test_reset_strategy_leaves_others_untouched(self):
         with TemporaryDirectory() as tmp:
             engine = self._make_engine(Path(tmp))
-            wallet_a = engine.wallets["breakout_retest"]
-            wallet_c = engine.wallets["mean_reversion"]
-            wallet_a.balance = 42.0  # simulate some activity
+            wallet_a_12 = engine.wallet_for("breakout_retest", 12)
+            wallet_a_2 = engine.wallet_for("breakout_retest", 2)
+            wallet_c = engine.wallet_for("mean_reversion", 7)
+            wallet_a_12.balance = 42.0  # simulate some activity
+            wallet_a_2.balance = 55.0
             wallet_c.balance = 77.0
 
             engine.reset_strategy("breakout_retest")
 
-            self.assertEqual(engine.wallets["breakout_retest"].balance, 100.0)  # reset to deposit
-            self.assertIsNot(engine.wallets["breakout_retest"], wallet_a)       # fresh instance
-            self.assertIs(engine.wallets["mean_reversion"], wallet_c)          # untouched, same object
+            # EVERY one of breakout_retest's checkpoint wallets resets, not just one.
+            self.assertEqual(engine.wallet_for("breakout_retest", 12).balance, 100.0)
+            self.assertEqual(engine.wallet_for("breakout_retest", 2).balance, 100.0)
+            self.assertIsNot(engine.wallet_for("breakout_retest", 12), wallet_a_12)  # fresh instance
+            self.assertIsNot(engine.wallet_for("breakout_retest", 2), wallet_a_2)
+            self.assertIs(engine.wallet_for("mean_reversion", 7), wallet_c)  # untouched, same object
             self.assertEqual(wallet_c.balance, 77.0)
             engine.storage.close()
 
@@ -72,8 +77,8 @@ class EngineResetStrategyTests(unittest.TestCase):
             engine = self._make_engine(Path(tmp))
 
             engine.update_strategy_settings({"breakout_retest": {"deposit_usd": 250.0}})
-            self.assertEqual(engine.wallets["breakout_retest"].initial_balance, 250.0)
-            self.assertEqual(engine.wallets["mean_reversion"].initial_balance, 100.0)  # untouched value
+            self.assertEqual(engine.wallet_for("breakout_retest", 12).initial_balance, 250.0)
+            self.assertEqual(engine.wallet_for("mean_reversion", 7).initial_balance, 100.0)  # untouched value
 
             with self.assertRaises(ValueError):
                 engine.update_strategy_settings({"breakout_retest": {"stake_fraction": 2.0}})
@@ -102,7 +107,7 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             engine1 = self._make_engine(tmp_path)
-            engine1.wallets["breakout_retest"].balance = 142.5  # simulate accumulated profit
+            engine1.wallet_for("breakout_retest", 12).balance = 142.5  # simulate accumulated profit
             engine1.storage.write_snapshot(engine1.wallets)
             engine1.storage.close()
 
@@ -113,8 +118,11 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
             provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
             engine2 = Engine(cfg2, provider2, storage2)
 
-            self.assertEqual(engine2.wallets["breakout_retest"].balance, 142.5)
-            self.assertEqual(engine2.wallets["breakout_retest"].initial_balance, 100.0)
+            self.assertEqual(engine2.wallet_for("breakout_retest", 12).balance, 142.5)
+            self.assertEqual(engine2.wallet_for("breakout_retest", 12).initial_balance, 100.0)
+            # A DIFFERENT checkpoint of the SAME strategy is a completely
+            # separate wallet — untouched by the "12" one's saved balance.
+            self.assertEqual(engine2.wallet_for("breakout_retest", 2).balance, 100.0)
             engine2.storage.close()
 
     def test_reserved_capital_is_refunded_to_balance_on_restore(self):
@@ -125,7 +133,7 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             engine1 = self._make_engine(tmp_path)
-            wallet = engine1.wallets["breakout_retest"]
+            wallet = engine1.wallet_for("breakout_retest", 12)
             wallet.balance = 80.0
             wallet.reserved = 20.0  # e.g. one $20 stake still in flight
             engine1.storage.write_snapshot(engine1.wallets)
@@ -136,7 +144,7 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
             provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
             engine2 = Engine(cfg2, provider2, storage2)
 
-            restored = engine2.wallets["breakout_retest"]
+            restored = engine2.wallet_for("breakout_retest", 12)
             self.assertEqual(restored.balance, 100.0)  # 80 + the refunded 20
             self.assertEqual(restored.reserved, 0.0)
             engine2.storage.close()
@@ -149,20 +157,31 @@ class WalletRestoreOnStartupTests(unittest.TestCase):
         with TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             engine = self._make_engine(tmp_path)
-            engine.wallets["breakout_retest"].balance = 55.0
+            engine.wallet_for("breakout_retest", 12).balance = 55.0
             engine.storage.write_snapshot(engine.wallets)
 
             engine.reset()
 
-            self.assertEqual(engine.wallets["breakout_retest"].balance, 100.0)
+            self.assertEqual(engine.wallet_for("breakout_retest", 12).balance, 100.0)
             self.assertEqual(engine.storage.load_wallets(), {})  # nothing left to restore either
             engine.storage.close()
 
     def test_no_saved_row_starts_fresh_from_config(self):
         with TemporaryDirectory() as tmp:
             engine = self._make_engine(Path(tmp))  # nothing ever written to storage
-            self.assertEqual(engine.wallets["breakout_retest"].balance, 100.0)
-            self.assertEqual(engine.wallets["breakout_retest"].initial_balance, 100.0)
+            self.assertEqual(engine.wallet_for("breakout_retest", 12).balance, 100.0)
+            self.assertEqual(engine.wallet_for("breakout_retest", 12).initial_balance, 100.0)
+            engine.storage.close()
+
+    def test_each_checkpoint_gets_its_own_independent_wallet(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            wallets = [engine.wallet_for("breakout_retest", w) for w in (12, 7, 2)]
+            self.assertEqual(len({id(w) for w in wallets}), 3)  # three distinct objects
+            for w in wallets:
+                self.assertEqual(w.balance, 100.0)  # each gets the FULL deposit, not a split of it
+                self.assertEqual(w.strategy, "breakout_retest")
+            self.assertEqual({w.window_min for w in wallets}, {12, 7, 2})
             engine.storage.close()
 
 
@@ -214,13 +233,13 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
             # Exactly the "2" checkpoint is reachable/due here (see
             # _prime_entry_window) -> exactly one trade, not "however many
             # of [12, 7, 2] happen to be due at once".
-            trades = engine.wallets["breakout_retest"].trades
+            trades = engine.wallet_for("breakout_retest", 2).trades
             self.assertEqual(len(trades), 1)
             trade = trades[0]
             self.assertGreater(trade.entry_price, 0.05)  # NOT the naive quoted price
             self.assertNotEqual(trade.entry_price, market.up_price)
             self.assertEqual(trade.contracts, trade.stake_usd / trade.entry_price)
-            self.assertEqual(engine.wallets["mean_reversion"].trades, [])  # stubbed to no-signal
+            self.assertEqual(engine.wallet_for("mean_reversion", 2).trades, [])  # stubbed to no-signal
             engine.storage.close()
 
     async def test_signal_rejected_when_slippage_exceeds_max_slippage_pct(self):
@@ -252,7 +271,7 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()
 
-            self.assertEqual(engine.wallets["breakout_retest"].trades, [])
+            self.assertEqual(engine.wallet_for("breakout_retest", 2).trades, [])
             engine.storage.close()
 
     async def test_signal_allowed_when_slippage_within_max_slippage_pct(self):
@@ -282,7 +301,7 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()
 
-            self.assertEqual(len(engine.wallets["breakout_retest"].trades), 1)
+            self.assertEqual(len(engine.wallet_for("breakout_retest", 2).trades), 1)
             engine.storage.close()
 
 
@@ -336,7 +355,7 @@ class SettleExpiredTradesThrottleTests(unittest.IsolatedAsyncioTestCase):
     async def test_settlement_check_is_throttled_by_interval(self):
         with TemporaryDirectory() as tmp:
             engine = self._make_engine(Path(tmp))
-            wallet = engine.wallets["breakout_retest"]
+            wallet = engine.wallet_for("breakout_retest", 7)
             trade = self._make_expired_trade()
             wallet.open_trade(trade)
 
@@ -364,7 +383,7 @@ class SettleExpiredTradesThrottleTests(unittest.IsolatedAsyncioTestCase):
     async def test_marks_unresolved_after_max_attempts_and_refunds_stake(self):
         with TemporaryDirectory() as tmp:
             engine = self._make_engine(Path(tmp))
-            wallet = engine.wallets["breakout_retest"]
+            wallet = engine.wallet_for("breakout_retest", 7)
             trade = self._make_expired_trade()
             wallet.open_trade(trade)
             balance_after_open = wallet.balance
@@ -389,7 +408,7 @@ class SettleExpiredTradesThrottleTests(unittest.IsolatedAsyncioTestCase):
     async def test_settles_normally_once_outcome_is_available(self):
         with TemporaryDirectory() as tmp:
             engine = self._make_engine(Path(tmp))
-            wallet = engine.wallets["breakout_retest"]
+            wallet = engine.wallet_for("breakout_retest", 7)
             trade = self._make_expired_trade()  # direction UP
             wallet.open_trade(trade)
 
@@ -471,7 +490,7 @@ class ActivityFeedTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()
 
-            self.assertEqual(engine.wallets["breakout_retest"].trades, [])
+            self.assertEqual(engine.wallet_for("breakout_retest", 2).trades, [])
             rejected = [e for e in engine.activity_since() if e.strategy == "breakout_retest"]
             self.assertTrue(all(e.kind == "rejected" for e in rejected))
             self.assertTrue(any(f"{s_cfg.max_coefficient:.2f}" in e.message for e in rejected))
@@ -480,7 +499,7 @@ class ActivityFeedTests(unittest.IsolatedAsyncioTestCase):
     async def test_settle_logs_won_and_lost(self):
         with TemporaryDirectory() as tmp:
             engine = self._make_engine(Path(tmp))
-            wallet = engine.wallets["breakout_retest"]
+            wallet = engine.wallet_for("breakout_retest", 7)
             t_won = Trade(
                 strategy="breakout_retest", entry_window_min=7, series_id="S", inst_id="I1",
                 direction=Direction.UP, entry_price=0.4, stake_usd=10.0, contracts=25.0,
@@ -733,7 +752,7 @@ class CheckpointFeatureLoggingTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()
 
-            trade = engine.wallets["breakout_retest"].trades[0]
+            trade = engine.wallet_for("breakout_retest", 2).trades[0]
             rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["decision"], "opened")
@@ -764,7 +783,7 @@ class CheckpointFeatureLoggingTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()  # must not raise
 
-            self.assertEqual(len(engine.wallets["breakout_retest"].trades), 1)
+            self.assertEqual(len(engine.wallet_for("breakout_retest", 2).trades), 1)
             engine.storage.close()
 
 

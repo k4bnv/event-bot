@@ -81,12 +81,15 @@ CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy);
 CREATE INDEX IF NOT EXISTS idx_trades_closed_ts ON trades(closed_ts);
 
 CREATE TABLE IF NOT EXISTS wallets (
-    strategy TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY,
+    strategy TEXT NOT NULL,
+    window_min INTEGER,
     initial_balance REAL,
     balance REAL,
     reserved REAL,
     updated_at REAL
 );
+CREATE INDEX IF NOT EXISTS idx_wallets_strategy ON wallets(strategy);
 
 CREATE TABLE IF NOT EXISTS checkpoint_features (
     id TEXT PRIMARY KEY,
@@ -148,8 +151,34 @@ class Storage:
         # from different call stacks/tasks; sqlite3's default same-thread
         # check is stricter than we need here.
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._migrate_wallets_table()
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+
+    def _migrate_wallets_table(self) -> None:
+        """Old schema: wallets(strategy TEXT PRIMARY KEY, ...) — one row
+        per STRATEGY. New schema (see _SCHEMA above): one row per
+        (strategy, window_min), since balances are now split per entry
+        checkpoint. CREATE TABLE IF NOT EXISTS is a no-op against an
+        existing old-schema table, so every write_snapshot() on an
+        upgraded deployment would otherwise fail with "no such column:
+        window_min" forever. Old balances aren't preserved — there's no
+        principled way to map ONE old per-strategy balance onto N new
+        per-checkpoint ones — so this renames the old table aside (never
+        drops it) and every checkpoint just restarts from deposit_usd
+        once, same as a strategy that's never run before. trades and
+        checkpoint_features (the actual valuable accumulated history)
+        are completely untouched by this."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(wallets)").fetchall()}
+        if cols and "window_min" not in cols:
+            self._conn.execute("ALTER TABLE wallets RENAME TO wallets_legacy_pre_checkpoint_split")
+            self._conn.commit()
+            logger.warning(
+                "Migrated data/bot.db's wallets table to the new per-checkpoint schema "
+                "(old data renamed to wallets_legacy_pre_checkpoint_split, not deleted). "
+                "Every strategy's checkpoint balances restart from deposit_usd once — "
+                "trades and checkpoint_features history is untouched."
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -175,12 +204,19 @@ class Storage:
         self._conn.commit()
 
     def write_snapshot(self, wallets: dict[str, VirtualWallet]) -> None:
+        """`wallets` is keyed by Engine's own composite wallet id
+        (`"{strategy}:{window_min}"`, see Engine._wallet_key) — that key,
+        not just wallet.strategy, is what's persisted as the primary key,
+        since one strategy now has multiple independent wallets."""
         now = time.time()
-        rows = [(w.strategy, w.initial_balance, w.balance, w.reserved, now) for w in wallets.values()]
+        rows = [
+            (key, w.strategy, w.window_min, w.initial_balance, w.balance, w.reserved, now)
+            for key, w in wallets.items()
+        ]
         self._conn.executemany(
-            "INSERT INTO wallets (strategy, initial_balance, balance, reserved, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(strategy) DO UPDATE SET "
+            "INSERT INTO wallets (id, strategy, window_min, initial_balance, balance, reserved, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
             "initial_balance=excluded.initial_balance, balance=excluded.balance, "
             "reserved=excluded.reserved, updated_at=excluded.updated_at",
             rows,
@@ -188,14 +224,16 @@ class Storage:
         self._conn.commit()
 
     def load_wallets(self) -> dict[str, dict]:
-        """Every wallet row this DB currently has, keyed by strategy name —
-        whatever write_snapshot() last wrote for it. Used by the engine at
-        startup to resume each strategy's balance instead of restarting it
-        at deposit_usd every time the process restarts (a redeploy, a
-        crash, `docker compose up --build`, ...); a strategy with no row
-        here (first-ever launch, or one just reset) simply gets no restore
-        and starts fresh from config as before."""
-        cur = self._conn.execute("SELECT strategy, initial_balance, balance, reserved FROM wallets")
+        """Every wallet row this DB currently has, keyed by the same
+        composite wallet id write_snapshot() persisted it under
+        ("{strategy}:{window_min}" — see Engine._wallet_key). Used by the
+        engine at startup to resume each checkpoint's balance instead of
+        restarting it at deposit_usd every time the process restarts (a
+        redeploy, a crash, `docker compose up --build`, ...); a wallet
+        with no row here (first-ever launch, a newly-added checkpoint, or
+        one just reset) simply gets no restore and starts fresh from
+        config as before."""
+        cur = self._conn.execute("SELECT id, initial_balance, balance, reserved FROM wallets")
         return {
             row[0]: {"initial_balance": row[1], "balance": row[2], "reserved": row[3]}
             for row in cur.fetchall()

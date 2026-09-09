@@ -97,13 +97,38 @@ class Engine:
 
         self._build_wallets_and_strategies()
 
+    @staticmethod
+    def _wallet_key(strategy_name: str, window_min: int) -> str:
+        """Every configured entry_windows_min checkpoint gets its OWN
+        wallet — not just its own stats row (build_combo_stats already
+        did that from trade data alone) but its own actual capital, so
+        e.g. breakout_retest's "12 мин" checkpoint compounds completely
+        independently of its "2 мин" one instead of both drawing stake
+        from, and feeding wins back into, one shared pool. This composite
+        string is the ONE place that format is decided — Storage persists
+        it verbatim as the wallets table's primary key (see
+        write_snapshot/load_wallets)."""
+        return f"{strategy_name}:{window_min}"
+
+    def wallet_for(self, strategy_name: str, window_min: int) -> VirtualWallet:
+        """Convenience accessor mirroring _wallet_key — mainly for tests
+        and any future code that needs one specific checkpoint's wallet
+        rather than iterating self.wallets directly."""
+        return self.wallets[self._wallet_key(strategy_name, window_min)]
+
     def _build_wallets_and_strategies(self) -> None:
         enabled_names = self.cfg.enabled_strategy_names()
         if not enabled_names:
             raise RuntimeError("No strategies enabled in config.yaml — nothing to run.")
-        # One query up front rather than one per strategy — cheap, and
-        # keeps _build_wallets_and_strategies() the single place that
-        # decides "restore vs fresh start" for every wallet at once.
+        # Full rebuild, not an incremental update — clear first so a
+        # checkpoint removed from entry_windows_min (via the Settings tab)
+        # doesn't leave a stale, no-longer-tradeable wallet lingering in
+        # self.wallets forever after a reset() rebuild.
+        self.wallets.clear()
+        self.strategy_instances.clear()
+        # One query up front rather than one per (strategy, checkpoint) —
+        # cheap, and keeps _build_wallets_and_strategies() the single place
+        # that decides "restore vs fresh start" for every wallet at once.
         saved_wallets = self.storage.load_wallets()
         for s_cfg in self.cfg.strategies:
             if not s_cfg.enabled:
@@ -112,8 +137,14 @@ class Engine:
             # strategies.<name>.deposit_usd, default $100) — not a slice of
             # one shared pool. That's what makes a fair head-to-head
             # comparison possible: every strategy is judged on the same
-            # starting bankroll, not a fraction that shrinks as you enable more.
-            self.wallets[s_cfg.name] = self._restore_or_create_wallet(s_cfg, saved_wallets.get(s_cfg.name))
+            # starting bankroll, not a fraction that shrinks as you enable
+            # more. Same fairness applied one level deeper here: EACH of its
+            # configured entry checkpoints gets that same full deposit_usd
+            # again, independently — not a further split of it — so "12
+            # мин" and "2 мин" are judged on equal starting terms too.
+            for window_min in s_cfg.entry_windows_min:
+                key = self._wallet_key(s_cfg.name, window_min)
+                self.wallets[key] = self._restore_or_create_wallet(s_cfg, window_min, saved_wallets.get(key))
 
             strat_cls = STRATEGY_REGISTRY.get(s_cfg.name)
             if strat_cls is None:
@@ -126,16 +157,18 @@ class Engine:
             )
 
     @staticmethod
-    def _restore_or_create_wallet(s_cfg, saved: Optional[dict]) -> VirtualWallet:
-        """A fresh VirtualWallet(deposit_usd) if `saved` is None (first-ever
-        launch for this strategy, or one just reset) — otherwise resumes
-        the balance write_snapshot() persisted for it, so a redeploy/crash/
-        restart doesn't silently reset every strategy back to its starting
-        deposit while the Analytics tab (backed by the separately, every-
-        tick-persisted trades table) keeps remembering the full history.
+    def _restore_or_create_wallet(s_cfg, window_min: int, saved: Optional[dict]) -> VirtualWallet:
+        """A fresh VirtualWallet(deposit_usd) for this ONE checkpoint if
+        `saved` is None (first-ever launch, a checkpoint just added to
+        entry_windows_min, or one just reset) — otherwise resumes the
+        balance write_snapshot() persisted for it, so a redeploy/crash/
+        restart doesn't silently reset every checkpoint back to its
+        starting deposit while the Analytics tab (backed by the
+        separately, every-tick-persisted trades table) keeps remembering
+        the full history.
 
         initial_balance is restored too (not re-read from config) so
-        net_pnl/equity keep meaning "profit since this strategy's actual
+        net_pnl/equity keep meaning "profit since this checkpoint's actual
         first run", even across a config.yaml edit to deposit_usd later —
         that's what the Reset button/`--reset-strategy` are for instead.
 
@@ -149,14 +182,16 @@ class Engine:
         VirtualWallet.mark_unresolved() already uses for a settlement that
         times out."""
         if saved is None:
-            return VirtualWallet(strategy=s_cfg.name, initial_balance=s_cfg.deposit_usd)
-        wallet = VirtualWallet(strategy=s_cfg.name, initial_balance=saved["initial_balance"])
+            return VirtualWallet(strategy=s_cfg.name, window_min=window_min, initial_balance=s_cfg.deposit_usd)
+        wallet = VirtualWallet(
+            strategy=s_cfg.name, window_min=window_min, initial_balance=saved["initial_balance"],
+        )
         wallet.balance = saved["balance"] + saved["reserved"]
         if saved["reserved"]:
             logger.warning(
-                "Strategy '%s': restarted with $%.2f still reserved in-flight at the last "
+                "Strategy '%s' (%s мин): restarted with $%.2f still reserved in-flight at the last "
                 "snapshot — refunded to balance (its open trade(s) can't be resumed across a restart).",
-                s_cfg.name, saved["reserved"],
+                s_cfg.name, window_min, saved["reserved"],
             )
         return wallet
 
@@ -222,12 +257,19 @@ class Engine:
         logger.warning("Engine reset: all wallets/trades/timing cleared, storage wiped.")
 
     def reset_strategy(self, name: str) -> None:
-        """Reset just ONE strategy's wallet/trades/timing-history — every
-        other strategy's wallet, trades and persisted rows are left
+        """Reset just ONE strategy's wallets/trades/timing-history — every
+        other strategy's wallets, trades and persisted rows are left
         completely untouched. Used by the Settings tab's per-strategy
         Reset button. Raises ValueError for an unknown or disabled
         strategy name (there's nothing to reset for a strategy with no
-        wallet)."""
+        wallet).
+
+        Rebuilds ALL of this strategy's checkpoint wallets fresh — first
+        dropping every existing "name:*" key (not just the ones in the
+        CURRENT entry_windows_min list) so a checkpoint removed just
+        before this reset doesn't leave a stale wallet behind, mirroring
+        the same cleanup _build_wallets_and_strategies() does on a full
+        reset()."""
         s_cfg = next((s for s in self.cfg.strategies if s.name == name), None)
         if s_cfg is None:
             raise ValueError(f"unknown strategy '{name}'")
@@ -235,7 +277,12 @@ class Engine:
             raise ValueError(f"strategy '{name}' is not enabled")
 
         old_strategy = self.strategy_instances.get(name)
-        self.wallets[name] = VirtualWallet(strategy=name, initial_balance=s_cfg.deposit_usd)
+        prefix = f"{name}:"
+        for key in [k for k in self.wallets if k.startswith(prefix)]:
+            del self.wallets[key]
+        for window_min in s_cfg.entry_windows_min:
+            key = self._wallet_key(name, window_min)
+            self.wallets[key] = VirtualWallet(strategy=name, window_min=window_min, initial_balance=s_cfg.deposit_usd)
         strat_cls = STRATEGY_REGISTRY[name]
         self.strategy_instances[name] = strat_cls(config=dict(s_cfg.extra))
         if old_strategy is not None:
@@ -469,7 +516,6 @@ class Engine:
             if not s_cfg.enabled:
                 continue
             strategy = self.strategy_instances[s_cfg.name]
-            wallet = self.wallets[s_cfg.name]
 
             for series_id in self.cfg.okx.series_ids:
                 market = active_markets.get(series_id)
@@ -483,6 +529,12 @@ class Engine:
                     series_id, market.expiry_ts, s_cfg.name, remaining, s_cfg.entry_windows_min
                 )
                 for window_min in due_windows:
+                    # Each entry checkpoint has its own wallet (see
+                    # _wallet_key) — looked up per window_min, not once per
+                    # strategy, since that's exactly the isolation this
+                    # split is for: "12 мин" stakes/wins/loses out of its
+                    # own pool, completely independent of "2 мин"'s.
+                    wallet = self.wallets[self._wallet_key(s_cfg.name, window_min)]
                     ctx = StrategyContext(
                         price_history=self.provider.btc_price_history(),
                         orderbook=self.provider.btc_orderbook(),

@@ -742,8 +742,8 @@ async function tick(){
 }
 
 async function resetOneStrategy(name){
-  if (!confirm(`Сбросить только "${name}"? Её кошелёк и история сделок начнутся заново, ` +
-               'остальные стратегии не тронет. Действие необратимо.')) return;
+  if (!confirm(`Сбросить только "${name}"? Все её кошельки (по каждому окну входа) и история ` +
+               'сделок начнутся заново, остальные стратегии не тронет. Действие необратимо.')) return;
   try {
     const r = await fetch('/api/reset_strategy', {
       method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ strategy: name }),
@@ -906,10 +906,15 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
     async def state() -> JSONResponse:
         snap = engine.snapshot()
 
+        # snap.wallets is keyed by Engine's composite "strategy:window_min"
+        # wallet id (one wallet per entry checkpoint now, not per
+        # strategy) — the base strategy name/display_name lookup has to
+        # come from w.strategy, not the dict key itself.
         wallets = [
             {
-                "strategy": name,
-                "display_name": display_names.get(name, name),
+                "strategy": w.strategy,
+                "window_min": w.window_min,
+                "display_name": f"{display_names.get(w.strategy, w.strategy)} ({w.window_min}м)",
                 "initial_balance": w.initial_balance,
                 "balance": w.balance,
                 "reserved": w.reserved,
@@ -918,7 +923,7 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
                 "open_trades": len(w.open_trades()),
                 "equity_curve": _equity_curve(w),
             }
-            for name, w in snap.wallets.items()
+            for w in sorted(snap.wallets.values(), key=lambda w: (w.strategy, -(w.window_min or 0)))
         ]
 
         combos = [
