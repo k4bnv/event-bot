@@ -18,6 +18,7 @@ import csv
 import logging
 import sys
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -26,9 +27,11 @@ from src.engine import Engine
 from src.logger import setup_logging
 from src.market_data import OkxMarketDataProvider
 from src.mock_market import MockMarketDataProvider
-from src.models import OrderBookLevel, simulate_market_fill
+from src.models import EventMarket, OrderBookLevel, PricePoint, simulate_market_fill
 from src.okx_client import OKXClient, OKXClientConfig
 from src.storage import Storage
+from src.strategies.ai_prompt import AIPromptStrategy, build_client_config
+from src.strategies.base import StrategyContext
 
 logger = logging.getLogger("okx_event_bot.run")
 
@@ -332,6 +335,107 @@ async def check_liquidity(
         _save_liquidity_csv(cfg, all_rows)
 
 
+async def check_ai_prompt(cfg) -> None:
+    """Utility mode: send ONE real test call through the ai_prompt
+    strategy's actual client/prompt-building code (same config.yaml
+    provider/model it uses live) against a synthetic-but-plausible market
+    context, and print exactly what came back.
+
+    Why this exists: ai_prompt only fires on its configured
+    entry_windows_min checkpoints, at most once per min_seconds_between_calls
+    — waiting for that live, then digging through data/bot.log to see what
+    happened, is slow. This bypasses all of that: no live OKX data needed
+    (works even with mock_mode/no OKX keys — the synthetic context below
+    has everything the prompt template needs), and a freshly-constructed
+    AIPromptStrategy's cooldown starts at 0, so the very first call always
+    goes through regardless of min_seconds_between_calls. Answers "is this
+    even configured right" (key/provider/model) separately from "did it
+    actually decide to trade on live conditions" (a real market judgment
+    call, not something this test can substitute for).
+
+    Every possible reason "not opening trades" turns out to be something
+    OTHER than a broken LLM call — enabled: false, no API key, cooldown/
+    daily-cap not elapsed yet, entry_windows_min just not due, or the
+    resulting signal getting rejected downstream by max_coefficient/
+    max_slippage_pct — is called out explicitly in the output so this
+    doesn't get misread as "the LLM path is broken" when it isn't.
+    """
+    ai_cfg = next((s for s in cfg.strategies if s.name == "ai_prompt"), None)
+    if ai_cfg is None:
+        print("No 'ai_prompt' entry under strategies: in config.yaml.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"enabled in config.yaml: {ai_cfg.enabled}")
+    if not ai_cfg.enabled:
+        print("  -> this is almost certainly why it's not opening trades live: flip to "
+              "'enabled: true' (dashboard Settings tab, or config.yaml + restart).")
+
+    merged_config = dict(ai_cfg.extra)
+    provider = str(merged_config.get("provider", "requesty")).lower()
+    client_cfg = build_client_config(merged_config)
+    if client_cfg is None:
+        key_env = {
+            "requesty": "REQUESTY_API_KEY", "deepseek": "DEEPSEEK_API_KEY",
+            "openai_compatible": "OPENAI_COMPATIBLE_API_KEY",
+        }.get(provider, f"{provider.upper()}_API_KEY")
+        print(
+            f"\nNo API key found for provider='{provider}' ({key_env} unset in .env).\n"
+            "-> This is the other most likely reason for zero trades: the strategy silently "
+            "skips every single checkpoint (one WARNING logged the first time, then quiet) "
+            "rather than crash. Set the key in .env (copy from .env.example) and retry.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"provider={provider}  model={client_cfg.model}  base_url={client_cfg.base_url}")
+    print(
+        f"cost controls: min_seconds_between_calls={merged_config.get('min_seconds_between_calls', 300)}  "
+        f"max_calls_per_day={merged_config.get('max_calls_per_day', 100)}  "
+        f"entry_windows_min={ai_cfg.entry_windows_min}  "
+        f"(live, it only ever fires AT one of these checkpoints, at most once per cooldown — "
+        f"quiet in between is normal, not broken)"
+    )
+
+    # Synthetic-but-plausible context — a connectivity/parsing smoke test,
+    # not a live trading decision, so no real OKX data is fetched here.
+    now = time.time()
+    price_history = deque(PricePoint(ts=now - (30 - i) * 3, price=80000.0 + i * 5) for i in range(10))
+    market = EventMarket(
+        series_id="TEST-SERIES", method="price_up_down", inst_id="TEST-INST",
+        expiry_ts=now + 120, floor_strike=80000.0, up_price=0.5, state="live",
+    )
+    ctx = StrategyContext(
+        price_history=price_history, orderbook=None, remaining_sec=120.0, window_min=2,
+        market=market, funding_rate=0.0001,
+    )
+
+    print("\nSending one test prompt (bypasses cooldown — fresh instance)...")
+    strategy = AIPromptStrategy(config=merged_config)
+    try:
+        signal = await strategy.evaluate(ctx)
+    finally:
+        await strategy.aclose()
+
+    if signal is None:
+        print(
+            "\nResult: no signal (None). Check the WARNING/INFO lines above (or "
+            "data/bot.log, search for 'ai_prompt') for what actually happened — could be "
+            "a genuine NONE/low-confidence verdict from the model (working as intended), "
+            "or a real call failure (bad key, timeout, malformed JSON)."
+        )
+    else:
+        print(
+            f"\nResult: signal = {signal.direction.value.upper()}  "
+            f"confidence={signal.confidence:.2f}  reason={signal.reason!r}"
+        )
+        print(
+            "-> The LLM call/parse path works end-to-end. If it's still not trading live, "
+            "the cause is elsewhere: enabled: false, the cooldown/daily-cap not elapsed, "
+            "entry_windows_min checkpoint not due yet, or the signal getting rejected "
+            "downstream by max_coefficient/max_slippage_pct (see engine.py logs)."
+        )
+
+
 async def run_bot(cfg) -> None:
     storage = Storage(cfg.storage.data_dir)
 
@@ -447,6 +551,13 @@ def main() -> None:
              "(default: 30)",
     )
     parser.add_argument(
+        "--check-ai-prompt", action="store_true",
+        help="send ONE test call through the ai_prompt (strategy G) LLM client with a "
+             "synthetic market context, print what came back, and exit — fast way to check "
+             "'is this even configured right' without waiting on live entry-window "
+             "checkpoints or the call cooldown",
+    )
+    parser.add_argument(
         "--reset-data", action="store_true",
         help="wipe data/bot.db (all strategies), then exit "
              "(equivalent to the web dashboard's Reset DB button, for console-mode users)",
@@ -459,7 +570,12 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    setup_logging(cfg.storage.data_dir, console_level=logging.WARNING)
+    # --check-ai-prompt wants the ai_prompt logger's own "raw response"/
+    # warning lines visible on the console (normally file-only, WARNING+
+    # on console, so the console dashboard isn't spammed) — everyone else
+    # keeps the quiet default.
+    console_level = logging.INFO if args.check_ai_prompt else logging.WARNING
+    setup_logging(cfg.storage.data_dir, console_level=console_level)
 
     if args.discover_series:
         asyncio.run(discover_series(cfg))
@@ -469,6 +585,10 @@ def main() -> None:
         asyncio.run(check_liquidity(
             cfg, test_stake_usd=args.test_stake, samples=args.samples, interval_sec=args.interval_sec,
         ))
+        return
+
+    if args.check_ai_prompt:
+        asyncio.run(check_ai_prompt(cfg))
         return
 
     if args.reset_data:
