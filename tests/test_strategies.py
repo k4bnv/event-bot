@@ -353,6 +353,38 @@ class AbsorptionReversalStrategyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, Direction.UP)
 
+    async def test_full_pass_writes_every_diagnostic_stage(self):
+        # ctx.diagnostics (see StrategyContext) is what ends up in
+        # checkpoint_features' extra_json — a full pass through all three
+        # phases should leave every stage's numbers behind, not just the
+        # ones that happened to end up in signal.reason's free text.
+        strategy = AbsorptionReversalStrategy(config={})
+        ctx = make_absorption_ctx("sell")
+        signal = await strategy.evaluate(ctx)
+        self.assertIsNotNone(signal)
+        for key in (
+            "spread_pct", "n_prints", "tfi", "volume_multiple", "actual_return_pct",
+            "predicted_return_pct", "residual_pct", "candidate_direction",
+            "replenish_ratio", "broke_local_range",
+        ):
+            self.assertIn(key, ctx.diagnostics)
+        self.assertEqual(ctx.diagnostics["candidate_direction"], "up")
+        self.assertTrue(ctx.diagnostics["broke_local_range"])
+
+    async def test_early_bail_still_writes_the_stages_it_reached(self):
+        # Phase A rejects on TFI alone here — Phase B/C's diagnostics
+        # (replenish_ratio, broke_local_range) must NOT appear, since
+        # evaluate() never got that far, but everything up to and
+        # including the tfi check should still be logged as "why not".
+        strategy = AbsorptionReversalStrategy(config={"min_abs_tfi": 0.99})
+        ctx = make_absorption_ctx("sell")
+        signal = await strategy.evaluate(ctx)
+        self.assertIsNone(signal)
+        self.assertIn("spread_pct", ctx.diagnostics)
+        self.assertIn("tfi", ctx.diagnostics)
+        self.assertNotIn("residual_pct", ctx.diagnostics)
+        self.assertNotIn("replenish_ratio", ctx.diagnostics)
+
     async def test_full_setup_signals_down_on_absorbed_buying(self):
         strategy = AbsorptionReversalStrategy(config={})
         signal = await strategy.evaluate(make_absorption_ctx("buy"))

@@ -363,6 +363,59 @@ class CheckpointFeaturesTests(unittest.TestCase):
             self.assertEqual(storage.count_checkpoint_features(strategy="a"), 1)
             storage.close()
 
+    def test_extra_json_round_trips(self):
+        # See StrategyContext.diagnostics/Engine._record_checkpoint_features
+        # — a strategy's own numeric diagnostics (e.g. absorption_reversal's
+        # tfi/residual_pct), serialized as JSON text, not parsed here —
+        # storage.py just stores/returns the string as-is.
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            payload = '{"tfi": -0.74, "residual_pct": 0.073}'
+            storage.log_checkpoint_features(make_feature_row(strategy="absorption_reversal", extra_json=payload))
+            rows = storage.get_checkpoint_features(strategy="absorption_reversal")
+            self.assertEqual(rows[0]["extra_json"], payload)
+            storage.close()
+
+    def test_extra_json_defaults_to_null_when_not_provided(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(strategy="breakout_retest"))
+            rows = storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertIsNone(rows[0]["extra_json"])
+            storage.close()
+
+    def test_migrates_old_schema_missing_extra_json_without_crashing(self):
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bot.db"
+            import sqlite3
+            conn = sqlite3.connect(db_path)
+            old_cols = [f for f in FEATURE_FIELDS if f != "extra_json"]
+            conn.execute(f"CREATE TABLE checkpoint_features ({', '.join(f'{c} TEXT' for c in old_cols)})")
+            conn.execute(
+                f"INSERT INTO checkpoint_features ({', '.join(old_cols)}) VALUES ({', '.join('?' * len(old_cols))})",
+                ["old-row" if c == "id" else None for c in old_cols],
+            )
+            conn.commit()
+            conn.close()
+
+            storage = Storage(Path(tmp))  # must not raise despite the pre-existing table missing extra_json
+            old_rows = storage.get_checkpoint_features()
+            self.assertEqual(len(old_rows), 1)
+            self.assertEqual(old_rows[0]["id"], "old-row")
+            self.assertIsNone(old_rows[0]["extra_json"])  # migrated column, old row has nothing there
+
+            storage.log_checkpoint_features(make_feature_row(id_="new-row", extra_json='{"tfi": 1.0}'))
+            new_row = next(r for r in storage.get_checkpoint_features() if r["id"] == "new-row")
+            self.assertEqual(new_row["extra_json"], '{"tfi": 1.0}')
+            storage.close()
+
+    def test_fresh_database_checkpoint_features_needs_no_migration(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            cols = {row[1] for row in storage._conn.execute("PRAGMA table_info(checkpoint_features)").fetchall()}
+            self.assertIn("extra_json", cols)  # present from a fresh _SCHEMA, not via the migration path
+            storage.close()
+
 
 def make_closed_trade_with_features(
     storage: Storage, strategy: str = "a", won: bool = True, stake: float = 10.0,

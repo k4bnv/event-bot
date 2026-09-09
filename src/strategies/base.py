@@ -64,6 +64,21 @@ class StrategyContext:
     # checkpoint if an earlier signal got rejected (no live quote, low
     # balance, ...) rather than giving up on the market for good.
     already_open_this_market: bool = False
+    # A strategy that computes its own numeric diagnostics NOT already
+    # covered by the generic barrier-model fields (drift/z_score/etc. —
+    # see Engine._record_checkpoint_features) writes them in here, e.g.
+    # ctx.diagnostics["tfi"] = tfi. The engine reads this back into
+    # checkpoint_features' extra_json column AFTER evaluate() returns,
+    # regardless of whether it returned a Signal or None — so a
+    # no_signal row still carries "why not" (see absorption_reversal.py),
+    # not just the generic fields every strategy already gets. Mutable
+    # and strategy-writable by design (unlike the read-only fields
+    # above): the engine builds one fresh dict per checkpoint evaluation,
+    # so a strategy can write into it progressively as it works through
+    # its own gates, even ones it bails out of early. Ignored by every
+    # strategy that doesn't need it — an empty dict logs as NULL, not an
+    # empty "{}" string.
+    diagnostics: dict = field(default_factory=dict)
 
 
 class BaseStrategy(ABC):

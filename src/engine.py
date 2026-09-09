@@ -7,6 +7,7 @@ mock <-> live OKX data is a one-line change in run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -572,6 +573,15 @@ class Engine:
                 "fill_price": fill_price,
                 "stake_usd": stake_usd,
                 "trade_id": trade_id,
+                # Strategy-specific diagnostics NOT covered by the generic
+                # barrier-model fields above — see StrategyContext.diagnostics
+                # (e.g. absorption_reversal's tfi/residual_pct/replenish_ratio).
+                # ctx.diagnostics is written by evaluate() itself, so this
+                # captures "why not" even on a no_signal row, not just
+                # whatever made it into signal.reason's free text when a
+                # Signal actually existed. Most strategies never touch it,
+                # so most rows still log NULL here, not an empty "{}".
+                "extra_json": json.dumps(ctx.diagnostics) if ctx.diagnostics else None,
             }
             self.storage.log_checkpoint_features(row)
         except Exception:

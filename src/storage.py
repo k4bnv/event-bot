@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS checkpoint_features (
     decision TEXT NOT NULL,
     fill_price REAL,
     stake_usd REAL,
-    trade_id TEXT
+    trade_id TEXT,
+    extra_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_checkpoint_features_strategy ON checkpoint_features(strategy);
 CREATE INDEX IF NOT EXISTS idx_checkpoint_features_ts ON checkpoint_features(ts);
@@ -132,7 +133,7 @@ FEATURE_FIELDS = [
     "drift_5m_pct", "mom_1m_pct", "z_score", "base_prob", "sigma_horizon_pct",
     "orderbook_bid_vol", "orderbook_ask_vol", "funding_rate", "previous_outcome",
     "signal_direction", "signal_confidence", "signal_reason", "decision",
-    "fill_price", "stake_usd", "trade_id",
+    "fill_price", "stake_usd", "trade_id", "extra_json",
 ]
 
 FEATURE_SORTABLE_COLUMNS = {
@@ -158,6 +159,7 @@ class Storage:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._migrate_wallets_table()
         self._conn.executescript(_SCHEMA)
+        self._migrate_checkpoint_features_table()
         self._conn.commit()
 
     def _migrate_wallets_table(self) -> None:
@@ -184,6 +186,22 @@ class Storage:
                 "Every strategy's checkpoint balances restart from deposit_usd once — "
                 "trades and checkpoint_features history is untouched."
             )
+
+    def _migrate_checkpoint_features_table(self) -> None:
+        """extra_json (see FEATURE_FIELDS/log_checkpoint_features) was
+        added after checkpoint_features first shipped. Unlike the wallets
+        migration above, this needs no rename/data-loss dance — adding a
+        nullable column to an existing SQLite table is always safe and
+        keeps every existing row exactly as it was (just NULL in the new
+        column). CREATE TABLE IF NOT EXISTS is still a no-op against an
+        existing table missing this column, so it's added explicitly
+        here, idempotently (skipped if already present — e.g. a database
+        that was just freshly created with the current _SCHEMA)."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(checkpoint_features)").fetchall()}
+        if cols and "extra_json" not in cols:
+            self._conn.execute("ALTER TABLE checkpoint_features ADD COLUMN extra_json TEXT")
+            self._conn.commit()
+            logger.warning("Migrated data/bot.db's checkpoint_features table: added extra_json column.")
 
     def close(self) -> None:
         self._conn.close()

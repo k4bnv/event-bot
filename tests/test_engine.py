@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 import unittest
@@ -941,6 +942,41 @@ class CheckpointFeatureLoggingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rows[0]["decision"], "no_signal")
             self.assertIsNone(rows[0]["signal_direction"])
             self.assertIsNone(rows[0]["trade_id"])
+            self.assertIsNone(rows[0]["extra_json"])  # this strategy never touches ctx.diagnostics
+            engine.storage.close()
+
+    async def test_strategy_diagnostics_are_logged_as_extra_json_even_on_no_signal(self):
+        # See StrategyContext.diagnostics — a strategy (e.g.
+        # absorption_reversal) writes its own numeric diagnostics into
+        # ctx.diagnostics progressively as it works through its own
+        # gates; the engine must log whatever's there regardless of
+        # whether evaluate() ends up returning a Signal or None, so a
+        # no_signal row still carries "why not".
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+
+            def fake_evaluate(ctx):
+                ctx.diagnostics["tfi"] = -0.74
+                ctx.diagnostics["residual_pct"] = 0.073
+                return _resolved(None)
+
+            engine.strategy_instances["breakout_retest"].evaluate = fake_evaluate
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _resolved(None)
+
+            await engine._open_due_trades()
+
+            rows = engine.storage.get_checkpoint_features(strategy="breakout_retest")
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["decision"], "no_signal")
+            self.assertEqual(json.loads(rows[0]["extra_json"]), {"tfi": -0.74, "residual_pct": 0.073})
             engine.storage.close()
 
     async def test_rejected_by_max_coefficient_logs_a_feature_row_with_fill_price(self):
