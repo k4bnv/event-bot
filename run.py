@@ -729,6 +729,324 @@ async def check_leadlag(
             print(f"\n(report saved to {report_path})")
 
 
+def _measure_upprice_reaction_lag(
+    impulses: list[dict], reactor_points: list[tuple[float, float, str]],
+    horizon_sec: float, react_threshold_abs: float,
+) -> list[dict]:
+    """Like _measure_reaction_lag, but for the event contract's own
+    up_price against impulses detected on a SEPARATE spot series. Two
+    differences that matter enough to need a dedicated function rather than
+    reusing _measure_reaction_lag directly:
+
+    1. up_price is a bounded probability [0, 1], not a raw price — a
+       percentage move means something very different near 0.02 than near
+       0.50, so the reaction threshold here (react_threshold_abs) is an
+       ABSOLUTE probability-point difference, not a percentage.
+
+    2. The event contract itself expires and rolls to a brand new instId
+       every window (see market_data.py) — a new instId is a different
+       strike/expiry, so its up_price is simply not the same quantity as
+       the old instId's. reactor_points carries (ts, up_price, inst_id) so
+       any impulse whose measurement span (its own start .. end of its
+       reaction horizon) crosses a rollover gets EXCLUDED from the result
+       rather than silently mis-reported as "no reaction" — the two mean
+       very different things and conflating them would make the summary
+       stats meaningless.
+
+    Returns one dict per impulse: {"lag": float|None, "excluded": bool,
+    "reason": str}. lag mirrors _measure_reaction_lag's convention (0.0 =
+    already reacted by impulse end, a positive float = seconds later, None
+    = no usable reaction found)."""
+    results: list[dict] = []
+    for imp in impulses:
+        start_ts, end_ts, direction = imp["start_ts"], imp["end_ts"], imp["direction"]
+
+        pre_price = pre_inst = None
+        base_price = base_inst = None
+        for ts, price, inst_id in reactor_points:
+            if ts <= start_ts:
+                pre_price, pre_inst = price, inst_id
+            if ts <= end_ts:
+                base_price, base_inst = price, inst_id
+            else:
+                break
+
+        if base_price is None:
+            results.append({"lag": None, "excluded": False, "reason": "no up_price data at impulse time"})
+            continue
+
+        if pre_inst is not None and base_inst is not None and pre_inst != base_inst:
+            results.append({
+                "lag": None, "excluded": True,
+                "reason": "contract rolled over between impulse start and end",
+            })
+            continue
+
+        if pre_price is not None:
+            already = base_price - pre_price
+            if (direction == "up" and already >= react_threshold_abs) or (
+                direction == "down" and already <= -react_threshold_abs
+            ):
+                results.append({"lag": 0.0, "excluded": False, "reason": ""})
+                continue
+
+        found = None
+        rolled = False
+        for ts, price, inst_id in reactor_points:
+            if ts <= end_ts:
+                continue
+            if ts - end_ts > horizon_sec:
+                break
+            if inst_id != base_inst:
+                rolled = True
+                break
+            move = price - base_price
+            if (direction == "up" and move >= react_threshold_abs) or (
+                direction == "down" and move <= -react_threshold_abs
+            ):
+                found = ts - end_ts
+                break
+
+        if found is not None:
+            results.append({"lag": found, "excluded": False, "reason": ""})
+        elif rolled:
+            results.append({
+                "lag": None, "excluded": True,
+                "reason": "contract rolled over during the reaction-measurement horizon",
+            })
+        else:
+            results.append({"lag": None, "excluded": False, "reason": f"no reaction within {horizon_sec:.0f}s"})
+    return results
+
+
+async def check_internal_leadlag(
+    cfg, duration_sec: float = 300.0, poll_interval_sec: float = 1.0,
+    impulse_threshold_pct: float = 0.03, window_sec: float = 10.0,
+    lag_horizon_sec: float = 20.0, upprice_react_threshold: float = 0.02,
+    series_id: Optional[str] = None, resolve_interval_sec: float = 15.0,
+) -> None:
+    """Utility mode: measure whether OKX's own event-contract up_price lags
+    OKX's own spot BTC-USDT ticker — both on OKX, no Binance involved. The
+    natural follow-up to --check-leadlag: even if OKX spot itself keeps up
+    with Binance just fine, the CONTRACT's up_price is a separate, less
+    liquid, derived quantity (probability, not price) — its own market
+    makers could still re-quote slower than spot moves, which would be a
+    cleaner edge than cross-exchange lag since there's no extra network hop
+    to a second exchange involved in exploiting it.
+
+    Unlike --check-leadlag this needs OKX API keys: finding the currently
+    live instId requires the signed get_event_markets call (see
+    discover_series) even though the ticker polls themselves are public.
+
+    Method: poll OKX spot + the live event contract's own ticker every
+    poll_interval_sec, detect impulses on the SPOT series (same detector as
+    --check-leadlag), then measure how long up_price took to move by
+    >= upprice_react_threshold probability points in the matching
+    direction. Any impulse whose measurement window spans a contract
+    rollover (a new instId — different strike/expiry, not a comparable
+    quantity) is EXCLUDED from the stats rather than mis-reported as "no
+    reaction" — see _measure_upprice_reaction_lag.
+    """
+    if not (cfg.okx.api_key and cfg.okx.api_secret and cfg.okx.api_passphrase):
+        print(
+            "--check-leadlag-internal needs OKX Demo Trading API keys (event-contract "
+            "endpoints require authentication even for read-only browsing, to resolve the "
+            "live instId). Copy .env.example to .env and fill in OKX_API_KEY / "
+            "OKX_API_SECRET / OKX_API_PASSPHRASE first.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    sid = series_id or (cfg.okx.series_ids[0] if cfg.okx.series_ids else None)
+    if not sid:
+        print("No --series-id given and config.yaml has no okx.series_ids configured.", file=sys.stderr)
+        sys.exit(1)
+
+    client_cfg = OKXClientConfig(
+        base_url=cfg.okx.base_url, api_key=cfg.okx.api_key, api_secret=cfg.okx.api_secret,
+        api_passphrase=cfg.okx.api_passphrase, demo_trading=cfg.okx.demo_trading,
+        timeout_sec=cfg.okx.request_timeout_sec, max_retries=cfg.okx.max_retries,
+    )
+
+    data_dir = Path(cfg.storage.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    samples_path = data_dir / f"leadlag_internal_samples_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+
+    print(
+        f"Collecting {duration_sec:.0f}s of OKX spot BTC-USDT ({cfg.okx.underlying_inst_id}) vs series "
+        f"'{sid}''s own live event-contract up_price, polling every {poll_interval_sec:.1f}s.\n"
+        f"Raw samples are written incrementally to {samples_path} as they come in — if this "
+        f"session gets disconnected partway through, that file still has everything collected "
+        f"up to the disconnect.\n"
+    )
+
+    def _exp_ms(m: dict) -> float:
+        raw = m.get("expTime")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return float("inf")
+
+    async def _resolve_inst_id(client: OKXClient) -> Optional[str]:
+        try:
+            markets = await client.get_event_markets(series_id=sid, state="live")
+        except Exception:
+            return None
+        if not markets:
+            return None
+        chosen = min(markets, key=_exp_ms)
+        inst = chosen.get("instId")
+        return str(inst) if inst else None
+
+    spot_series: list[tuple[float, float]] = []
+    up_series: list[tuple[float, float, str]] = []
+
+    with open(samples_path, "w", newline="") as samples_file:
+        samples_writer = csv.DictWriter(samples_file, fieldnames=["ts", "spot_price", "up_price", "inst_id"])
+        samples_writer.writeheader()
+
+        async with OKXClient(client_cfg) as client:
+            inst_id = await _resolve_inst_id(client)
+            if not inst_id:
+                print(
+                    f"No live instrument found for series '{sid}' right now — try again later "
+                    f"or check config.yaml -> okx.series_ids.", file=sys.stderr,
+                )
+                return
+            print(f"Tracking live instrument: {inst_id}\n")
+
+            end_at = time.time() + duration_sec
+            last_resolve = time.time()
+            n = 0
+            while time.time() < end_at:
+                tick_start = time.time()
+
+                if tick_start - last_resolve >= resolve_interval_sec:
+                    new_inst_id = await _resolve_inst_id(client)
+                    last_resolve = tick_start
+                    if new_inst_id and new_inst_id != inst_id:
+                        print(f"  ...instrument rolled over: {inst_id} -> {new_inst_id}")
+                        inst_id = new_inst_id
+
+                spot_price, up_price = await asyncio.gather(
+                    _fetch_okx_spot_price(client, cfg.okx.underlying_inst_id),
+                    _fetch_okx_spot_price(client, inst_id),
+                )
+                now = time.time()
+                if spot_price is not None:
+                    spot_series.append((now, spot_price))
+                if up_price is not None:
+                    up_series.append((now, up_price, inst_id))
+                samples_writer.writerow(
+                    {"ts": now, "spot_price": spot_price, "up_price": up_price, "inst_id": inst_id}
+                )
+                samples_file.flush()
+                n += 1
+                if n % 30 == 0:
+                    remaining = max(0.0, end_at - time.time())
+                    print(f"  ...{n} samples so far, ~{remaining:.0f}s left (saved to {samples_path.name})")
+                elapsed = time.time() - tick_start
+                await asyncio.sleep(max(0.0, poll_interval_sec - elapsed))
+
+    print(f"\nCollected {len(spot_series)} spot samples, {len(up_series)} up_price samples "
+          f"(raw data in {samples_path}).")
+    if len(spot_series) < 10 or len(up_series) < 10:
+        print("Not enough data to analyze (too many failed requests?) — check network/API access and retry.")
+        return
+
+    report_lines: list[str] = []
+
+    def out(line: str = "") -> None:
+        print(line)
+        report_lines.append(line)
+
+    report_path = data_dir / f"leadlag_internal_report_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        impulses = _detect_impulses(spot_series, impulse_threshold_pct, window_sec, cooldown_sec=window_sec)
+        out(
+            f"\nDetected {len(impulses)} impulses on OKX spot BTC-USDT "
+            f"(>= {impulse_threshold_pct:.3f}% move within {window_sec:.0f}s, "
+            f"{window_sec:.0f}s cooldown between detections):"
+        )
+        for imp in impulses:
+            t = time.strftime("%H:%M:%S", time.localtime(imp["end_ts"]))
+            out(f"  {t}  {imp['direction'].upper():5s}  move={imp['move_pct']:+.3f}%")
+
+        if not impulses:
+            out(
+                "\nNo impulses detected in this window — try a longer --duration-sec, run during a more "
+                "volatile period, or lower --impulse-threshold-pct. Can't measure a lag with no events to "
+                "measure it from."
+            )
+            return
+
+        results = _measure_upprice_reaction_lag(impulses, up_series, lag_horizon_sec, upprice_react_threshold)
+        out(
+            f"\nEvent contract up_price reaction (>= {upprice_react_threshold:.3f} probability-point "
+            f"same-direction move within {lag_horizon_sec:.0f}s of the spot impulse):"
+        )
+        for imp, res in zip(impulses, results):
+            if res["excluded"]:
+                status = f"EXCLUDED ({res['reason']})"
+            elif res["lag"] is not None:
+                status = f"{res['lag']:.1f}s later"
+            else:
+                status = res["reason"] or f"no reaction within {lag_horizon_sec:.0f}s"
+            out(f"  spot {imp['direction'].upper():5s} {imp['move_pct']:+.3f}%  ->  up_price: {status}")
+
+        excluded_n = sum(1 for r in results if r["excluded"])
+        usable = [r for r in results if not r["excluded"]]
+        reacted = sorted(r["lag"] for r in usable if r["lag"] is not None)
+
+        out(f"\n{'=' * 64}\nSummary\n{'=' * 64}")
+        if excluded_n:
+            out(
+                f"{excluded_n}/{len(impulses)} impulses excluded from the stats below (a contract rollover "
+                f"fell inside their measurement window, making before/after up_price not comparable)."
+            )
+        if not usable:
+            out("No usable (non-excluded) impulses left — rerun with a longer --duration-sec.")
+            return
+        if not reacted:
+            out(
+                f"0/{len(usable)} usable impulses got any up_price reaction within {lag_horizon_sec:.0f}s — "
+                f"either it didn't move at all, or reacted too fast/small to separate from noise at this "
+                f"threshold. Try a lower --upprice-react-threshold or a longer --lag-horizon-sec before "
+                f"concluding there's nothing here."
+            )
+            return
+
+        median = reacted[len(reacted) // 2]
+        out(
+            f"{len(reacted)}/{len(usable)} usable impulses got an up_price reaction within "
+            f"{lag_horizon_sec:.0f}s.\nlag (seconds):  min={min(reacted):.1f}  median={median:.1f}  "
+            f"mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
+        )
+        if median < poll_interval_sec * 1.5:
+            out(
+                "\n-> up_price reacts about as fast as our own polling resolution can even distinguish — "
+                "no usable internal lag visible at this measurement granularity. Consistent with the "
+                "contract's market makers re-quoting essentially in lockstep with spot."
+            )
+        else:
+            out(
+                f"\n-> up_price appears to lag OKX's own spot by ~{median:.1f}s on average — POTENTIALLY "
+                f"exploitable: after a spot impulse, the side that just became more likely (UP after a spot "
+                f"jump up, DOWN after a drop) is briefly still priced at its OLD, cheaper probability, so "
+                f"buying it right after the spot impulse — before up_price catches up — would be +EV on "
+                f"average, IF this holds up. Caveats before building anything on this: (1) a handful of "
+                f"impulses isn't a lot of samples — rerun with a longer --duration-sec / during more "
+                f"volatile periods; (2) this still has to survive the slippage measured with "
+                f"--check-liquidity, and reacting within {median:.1f}s means your order also has to land "
+                f"within that window; (3) rollover-excluded impulses aren't counted here — a lag right "
+                f"around expiry could behave differently and wouldn't show up in this number."
+            )
+    finally:
+        if report_lines:
+            report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+            print(f"\n(report saved to {report_path})")
+
+
 async def run_bot(cfg) -> None:
     storage = Storage(cfg.storage.data_dir)
 
@@ -881,6 +1199,29 @@ def main() -> None:
              "reaction before giving up on that impulse (default: 20)",
     )
     parser.add_argument(
+        "--check-leadlag-internal", action="store_true",
+        help="measure whether OKX's own event-contract up_price lags OKX's own spot "
+             "BTC-USDT ticker (both on OKX — the follow-up question to --check-leadlag). "
+             "Needs OKX API keys, unlike --check-leadlag, to resolve the live instId",
+    )
+    parser.add_argument(
+        "--series-id", metavar="SERIES",
+        help="override which okx.series_ids entry --check-leadlag-internal tracks "
+             "(default: the first one in config.yaml)",
+    )
+    parser.add_argument(
+        "--upprice-react-threshold", type=float, default=0.02, metavar="PROB",
+        help="minimum absolute probability-point move in up_price to count as a reaction "
+             "for --check-leadlag-internal (default: 0.02, i.e. 2 probability points — "
+             "up_price is bounded [0,1] so this is absolute, not a percentage)",
+    )
+    parser.add_argument(
+        "--resolve-interval-sec", type=float, default=15.0, metavar="SEC",
+        help="how often --check-leadlag-internal re-checks which instId is live (default: "
+             "15 — this is the heavier signed get_event_markets call, so it's not re-checked "
+             "every poll tick like the ticker fetches are)",
+    )
+    parser.add_argument(
         "--reset-data", action="store_true",
         help="wipe data/bot.db (all strategies), then exit "
              "(equivalent to the web dashboard's Reset DB button, for console-mode users)",
@@ -919,6 +1260,15 @@ def main() -> None:
             cfg, duration_sec=args.duration_sec, poll_interval_sec=args.poll_interval_sec,
             impulse_threshold_pct=args.impulse_threshold_pct, window_sec=args.window_sec,
             lag_horizon_sec=args.lag_horizon_sec,
+        ))
+        return
+
+    if args.check_leadlag_internal:
+        asyncio.run(check_internal_leadlag(
+            cfg, duration_sec=args.duration_sec, poll_interval_sec=args.poll_interval_sec,
+            impulse_threshold_pct=args.impulse_threshold_pct, window_sec=args.window_sec,
+            lag_horizon_sec=args.lag_horizon_sec, upprice_react_threshold=args.upprice_react_threshold,
+            series_id=args.series_id, resolve_interval_sec=args.resolve_interval_sec,
         ))
         return
 
