@@ -10,7 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import yaml
 from dotenv import load_dotenv
@@ -46,6 +46,16 @@ class StrategyConfig:
     entry_windows_min: list[int]
     max_coefficient: float
     stake_fraction: float
+    # Reject a signal if the honest book-simulated fill price (see
+    # EventMarket.fill_price_for) is more than this many PERCENT worse
+    # than the naive quoted price (up_price/1-up_price) — the paper-
+    # trading analog of the "max slippage" guard a real OKX order lets you
+    # set before it refuses to fill. None (default) = no limit, i.e. the
+    # OLD behavior (only max_coefficient's absolute ceiling applies).
+    # Measured on live data (see README "Ограничения"): median slippage
+    # alone is already +66-109%, so a strict value here will reject a LOT
+    # of signals — pick deliberately, this isn't a small tuning knob.
+    max_slippage_pct: Optional[float] = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -82,6 +92,7 @@ _KNOWN_STRATEGY_FIELDS = {
     "entry_windows_min",
     "max_coefficient",
     "stake_fraction",
+    "max_slippage_pct",
 }
 
 DEFAULT_DEPOSIT_USD = 100.0
@@ -127,6 +138,9 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 entry_windows_min=list(s_raw.get("entry_windows_min", [12, 7, 2])),
                 max_coefficient=float(s_raw.get("max_coefficient", 0.55)),
                 stake_fraction=float(s_raw.get("stake_fraction", 0.08)),
+                max_slippage_pct=(
+                    float(s_raw["max_slippage_pct"]) if s_raw.get("max_slippage_pct") is not None else None
+                ),
                 extra=extra,
             )
         )

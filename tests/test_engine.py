@@ -141,6 +141,66 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(engine.wallets["mean_reversion"].trades, [])  # stubbed to no-signal
             engine.storage.close()
 
+    async def test_signal_rejected_when_slippage_exceeds_max_slippage_pct(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+
+            s_cfg = next(s for s in engine.cfg.strategies if s.name == "breakout_retest")
+            s_cfg.max_slippage_pct = 50.0  # reject anything more than 50% worse than quoted
+
+            expiry_ts = time.time() + 60
+            # Same book as the VWAP test above: quoted 0.05, real fill ~0.30
+            # — ~500% worse, way over this strategy's 50% cap.
+            book = OrderBookSnapshot(
+                ts=time.time(),
+                asks=[OrderBookLevel(price=0.05, size=0.01), OrderBookLevel(price=0.30, size=1000.0)],
+            )
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.05, state="live", book=book,
+            )
+            engine.provider._active_markets[series_id] = market
+
+            strategy = engine.strategy_instances["breakout_retest"]
+            strategy.evaluate = lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
+            other = engine.strategy_instances["mean_reversion"]
+            other.evaluate = lambda ctx: _async_result(None)
+
+            await engine._open_due_trades()
+
+            self.assertEqual(engine.wallets["breakout_retest"].trades, [])
+            engine.storage.close()
+
+    async def test_signal_allowed_when_slippage_within_max_slippage_pct(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+
+            s_cfg = next(s for s in engine.cfg.strategies if s.name == "breakout_retest")
+            s_cfg.max_slippage_pct = 1000.0  # generous cap — this fill should pass
+
+            expiry_ts = time.time() + 60
+            book = OrderBookSnapshot(
+                ts=time.time(),
+                asks=[OrderBookLevel(price=0.05, size=0.01), OrderBookLevel(price=0.30, size=1000.0)],
+            )
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.05, state="live", book=book,
+            )
+            engine.provider._active_markets[series_id] = market
+
+            strategy = engine.strategy_instances["breakout_retest"]
+            strategy.evaluate = lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
+            other = engine.strategy_instances["mean_reversion"]
+            other.evaluate = lambda ctx: _async_result(None)
+
+            await engine._open_due_trades()
+
+            self.assertGreater(len(engine.wallets["breakout_retest"].trades), 0)
+            engine.storage.close()
+
 
 async def _async_result(value):
     return value

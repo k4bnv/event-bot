@@ -40,6 +40,18 @@ okx:
 # a slice of one shared pool. Default $100 each, override per-strategy below;
 # also changeable live from the web dashboard's "Депозит по стратегиям" panel
 # (applying there always resets, same as the Reset DB button — see README).
+#
+# max_slippage_pct (optional, not set by default): reject a signal if the
+# real book-simulated fill is more than this many PERCENT worse than the
+# quoted price — the paper-trading analog of the "max slippage" guard a
+# real OKX order lets you set before it refuses to fill. Unset = no limit
+# (only max_coefficient's absolute ceiling applies). Measured on live data
+# (see README "Ограничения"): median real slippage alone is already
+# +66-109%, so this is not a small tuning knob — e.g.
+# `max_slippage_pct: 100` already rejects roughly half of otherwise-valid
+# signals. Add it under any strategy below if you want it, e.g.:
+#   mean_reversion:
+#     max_slippage_pct: 150
 strategies:
   breakout_retest:
     enabled: true

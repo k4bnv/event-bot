@@ -290,6 +290,25 @@ class Engine:
                         )
                         continue
 
+                    # Paper-trading analog of the "max slippage" guard a
+                    # real OKX order lets you set before it refuses to
+                    # fill: reject if the honest price is more than
+                    # max_slippage_pct WORSE than the naive quote, even if
+                    # it's still under max_coefficient's absolute ceiling.
+                    # None (default/unset) = no limit, old behavior.
+                    if s_cfg.max_slippage_pct is not None:
+                        naive_price = market.price_for(signal.direction)
+                        if naive_price:
+                            slippage_pct = (price - naive_price) / naive_price * 100
+                            if slippage_pct > s_cfg.max_slippage_pct:
+                                logger.debug(
+                                    "%s: signal on %s rejected, slippage %.1f%% > max_slippage_pct %.1f%% "
+                                    "(quoted %.4f, real fill %.4f)",
+                                    s_cfg.name, series_id, slippage_pct, s_cfg.max_slippage_pct,
+                                    naive_price, price,
+                                )
+                                continue
+
                     trade = Trade(
                         strategy=s_cfg.name, entry_window_min=window_min, series_id=series_id,
                         inst_id=inst_id, direction=signal.direction, entry_price=price,
