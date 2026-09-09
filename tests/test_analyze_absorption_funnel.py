@@ -8,8 +8,8 @@ from tempfile import TemporaryDirectory
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from src.storage import FEATURE_FIELDS
-from analyze_absorption_funnel import load_rows, main  # noqa: E402
+from src.storage import FEATURE_FIELDS, Storage
+from analyze_absorption_funnel import load_rows, load_rows_from_db, main  # noqa: E402
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -48,6 +48,45 @@ class LoadRowsTests(unittest.TestCase):
             path = Path(tmp) / "export.csv"
             write_csv(path, [feature_row(strategy="breakout_retest")])
             self.assertEqual(load_rows(str(path)), [])
+
+
+class LoadRowsFromDbTests(unittest.TestCase):
+    """The auth-proof path: read bot.db directly, no dashboard/HTTP
+    involved — added after a live curl against a password-protected
+    dashboard silently downloaded an unauthorized-error JSON body
+    instead of a CSV, which load_rows_from_csv then quietly parsed as
+    "0 matching rows" rather than an error (no "strategy"/"extra_json"
+    header in the JSON body to match against)."""
+
+    def test_reads_real_storage_db_and_dispatches_via_sniffing(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(
+                {**{f: None for f in FEATURE_FIELDS}, "id": "f1", "strategy": "absorption_reversal",
+                 "decision": "no_signal", "extra_json": json.dumps({"tfi": -0.6})}
+            )
+            storage.log_checkpoint_features(
+                {**{f: None for f in FEATURE_FIELDS}, "id": "f2", "strategy": "breakout_retest",
+                 "decision": "no_signal", "extra_json": None}
+            )
+            db_path = storage.db_path
+            storage.close()
+
+            rows = load_rows_from_db(str(db_path))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["diag"]["tfi"], -0.6)
+
+            # load_rows (the dispatcher main() actually calls) must reach
+            # the same result by sniffing the file's own header, not by
+            # trusting a .db extension the user might not have used.
+            self.assertEqual(load_rows(str(db_path)), rows)
+
+    def test_a_real_csv_is_not_mistaken_for_a_database(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "export.csv"
+            write_csv(path, [feature_row(diag={"tfi": -0.5})])
+            rows = load_rows(str(path))
+            self.assertEqual(len(rows), 1)
 
 
 class MainFunnelOutputTests(unittest.TestCase):

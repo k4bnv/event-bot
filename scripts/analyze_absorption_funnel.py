@@ -13,17 +13,28 @@ instead of guessing which config knob to loosen.
 
 Usage:
     python3 scripts/analyze_absorption_funnel.py path/to/export.csv
+    python3 scripts/analyze_absorption_funnel.py data/bot.db
+
+The second form reads data/bot.db (SQLite) DIRECTLY — no need to go
+through the dashboard's /api/features/export.csv endpoint at all, which
+means no DASHBOARD_PASSWORD/session-cookie dance if the dashboard has
+one set (curl without a valid session cookie gets a 401 JSON body, not
+CSV — silently "0 rows" here, not an error, since it just fails to
+parse as the expected header). Point this straight at bot.db instead
+and skip the whole export/auth path; it's read-only (SELECT only).
 
 No third-party dependencies — safe to run directly inside the container
 too, e.g.:
-    docker compose exec okx-event-bot python3 scripts/analyze_absorption_funnel.py /app/data/export.csv
-(after copying/exporting the CSV there), or just run it locally on your
-own machine against a CSV downloaded via the dashboard's export button.
+    docker compose exec okx-event-bot python3 scripts/analyze_absorption_funnel.py /app/data/bot.db
+or just run it locally on your own machine against a CSV downloaded via
+the dashboard's export button, or the DB file directly (it's volume-
+mounted to the host at ./data/bot.db either way).
 """
 from __future__ import annotations
 
 import csv
 import json
+import sqlite3
 import statistics
 import sys
 
@@ -42,7 +53,17 @@ STAGES = [
 ]
 
 
-def load_rows(csv_path: str, strategy: str = "absorption_reversal") -> list[dict]:
+def _is_sqlite_db(path: str) -> bool:
+    """Sniff the file's own header rather than trust the extension — a
+    bot.db copied/renamed without its .db suffix should still work."""
+    try:
+        with open(path, "rb") as f:
+            return f.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def load_rows_from_csv(csv_path: str, strategy: str = "absorption_reversal") -> list[dict]:
     rows = []
     with open(csv_path, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
@@ -52,6 +73,30 @@ def load_rows(csv_path: str, strategy: str = "absorption_reversal") -> list[dict
             diag = json.loads(extra) if extra.strip() else {}
             rows.append({"decision": row.get("decision"), "diag": diag})
     return rows
+
+
+def load_rows_from_db(db_path: str, strategy: str = "absorption_reversal") -> list[dict]:
+    """Read straight from checkpoint_features — read-only, no writes, no
+    dashboard/HTTP/auth involved at all (see module docstring for why
+    this is the more robust path when DASHBOARD_PASSWORD is set)."""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT decision, extra_json FROM checkpoint_features WHERE strategy = ?", (strategy,),
+        )
+        rows = []
+        for decision, extra_json in cur.fetchall():
+            diag = json.loads(extra_json) if extra_json else {}
+            rows.append({"decision": decision, "diag": diag})
+        return rows
+    finally:
+        conn.close()
+
+
+def load_rows(path: str, strategy: str = "absorption_reversal") -> list[dict]:
+    if _is_sqlite_db(path):
+        return load_rows_from_db(path, strategy)
+    return load_rows_from_csv(path, strategy)
 
 
 def main(csv_path: str) -> None:
@@ -98,6 +143,6 @@ def main(csv_path: str) -> None:
 
 if __name__ == "__main__":
     if len(sys.argv) != 2:
-        print(f"Usage: python3 {sys.argv[0]} path/to/export.csv")
+        print(f"Usage: python3 {sys.argv[0]} path/to/export.csv (or data/bot.db)")
         sys.exit(1)
     main(sys.argv[1])
