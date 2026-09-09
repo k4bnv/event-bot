@@ -11,7 +11,22 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from run import _detect_impulses, _measure_reaction_lag, _measure_upprice_reaction_lag
+from run import _detect_impulses, _lag_percentile, _measure_reaction_lag, _measure_upprice_reaction_lag
+
+
+class LagPercentileTests(unittest.TestCase):
+    def test_median_of_odd_length(self):
+        self.assertAlmostEqual(_lag_percentile([1.0, 2.0, 3.0], 0.5), 2.0)
+
+    def test_p75_interpolates(self):
+        # index space: 0,1,2,3 for 4 values -> k = 3*0.75 = 2.25 -> between vals[2]=3 and vals[3]=4
+        self.assertAlmostEqual(_lag_percentile([1.0, 2.0, 3.0, 4.0], 0.75), 3.25)
+
+    def test_single_value(self):
+        self.assertEqual(_lag_percentile([5.0], 0.75), 5.0)
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(_lag_percentile([], 0.75), 0.0)
 
 
 def _flat_then_jump(n: int, jump_at: int, jump_pct: float, base: float = 80000.0) -> list[tuple[float, float]]:

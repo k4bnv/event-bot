@@ -559,6 +559,24 @@ def _measure_reaction_lag(
     return lags
 
 
+def _lag_percentile(sorted_vals: list[float], pct: float) -> float:
+    """Linear-interpolated percentile of an already-sorted list. Used
+    alongside min/median/mean/max in the leadlag summaries: a median alone
+    hides a skewed distribution — e.g. "most reactions are instant but a
+    meaningful minority take several seconds" reads as "no lag" if you only
+    look at the median, even though that slow tail might be the whole
+    story worth investigating."""
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    k = (len(sorted_vals) - 1) * pct
+    f, c = int(k), min(int(k) + 1, len(sorted_vals) - 1)
+    if f == c:
+        return sorted_vals[f]
+    return sorted_vals[f] + (sorted_vals[c] - sorted_vals[f]) * (k - f)
+
+
 async def check_leadlag(
     cfg, duration_sec: float = 300.0, poll_interval_sec: float = 1.0,
     impulse_threshold_pct: float = 0.03, window_sec: float = 10.0,
@@ -701,27 +719,41 @@ async def check_leadlag(
             return
 
         median = reacted[len(reacted) // 2]
+        p75 = _lag_percentile(reacted, 0.75)
+        tail_threshold = max(poll_interval_sec * 3, 2.0)
+        tail_n = sum(1 for l in reacted if l >= tail_threshold)
         out(
             f"{len(reacted)}/{len(impulses)} impulses got an OKX reaction within {lag_horizon_sec:.0f}s.\n"
-            f"lag (seconds):  min={min(reacted):.1f}  median={median:.1f}  "
+            f"lag (seconds):  min={min(reacted):.1f}  median={median:.1f}  p75={p75:.1f}  "
             f"mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
         )
-        if median < poll_interval_sec * 1.5:
+        if median < poll_interval_sec * 1.5 and p75 < poll_interval_sec * 1.5:
             out(
                 "\n-> OKX reacts about as fast as our own polling resolution can even distinguish — no "
                 "usable lag visible at this measurement granularity. Consistent with OKX spot being just "
                 "as fast/liquid as Binance (expected for a top-tier BTC/USDT pair — real arbitrageurs keep "
                 "them in sync to milliseconds, well below what REST polling can see)."
             )
+        elif tail_n == 0:
+            out(
+                f"\n-> median/p75 are elevated but no individual reaction reached the "
+                f"{tail_threshold:.1f}s tail cutoff — likely polling-interval noise pushing the stats "
+                f"around with a small sample, not a real lag. Rerun with a longer --duration-sec before "
+                f"drawing a conclusion either way."
+            )
         else:
             out(
-                f"\n-> OKX spot appears to lag Binance by ~{median:.1f}s on average — POTENTIALLY real. "
-                f"Caveats before building anything on this: (1) this measured raw SPOT price only, NOT the "
-                f"event contract's own up_price (a separate, nonlinear quantity — measure that specifically "
-                f"next); (2) a handful of impulses isn't a lot of samples — rerun with a longer "
-                f"--duration-sec / during more volatile periods to see if this holds up; (3) even a real "
-                f"few-second lag may not survive execution latency + the slippage we already measured with "
-                f"--check-liquidity."
+                f"\n-> mixed picture: median={median:.1f}s looks fast, but {tail_n}/{len(reacted)} "
+                f"({tail_n / len(reacted) * 100:.0f}%) reactions took >= {tail_threshold:.1f}s — a real, "
+                f"if inconsistent, tail of slow reactions rather than a fast, uniform one. Don't read the "
+                f"median alone as \"no lag\" here. Caveats before building anything on this: (1) this "
+                f"measured raw SPOT price only, NOT the event contract's own up_price (a separate, "
+                f"nonlinear quantity — measure that specifically with --check-leadlag-internal); (2) a "
+                f"handful of tail cases isn't a lot of samples — rerun with a longer --duration-sec / "
+                f"during more volatile periods to see if the tail rate holds up; (3) even a real occasional "
+                f"lag may not survive execution latency + the slippage measured with --check-liquidity, and "
+                f"since it doesn't happen every time you'd need to detect it live (impulse + no reaction "
+                f"yet) rather than assume it."
             )
     finally:
         if report_lines:
@@ -1017,29 +1049,46 @@ async def check_internal_leadlag(
             return
 
         median = reacted[len(reacted) // 2]
+        p75 = _lag_percentile(reacted, 0.75)
+        tail_threshold = max(poll_interval_sec * 3, 2.0)
+        tail_n = sum(1 for l in reacted if l >= tail_threshold)
         out(
             f"{len(reacted)}/{len(usable)} usable impulses got an up_price reaction within "
             f"{lag_horizon_sec:.0f}s.\nlag (seconds):  min={min(reacted):.1f}  median={median:.1f}  "
-            f"mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
+            f"p75={p75:.1f}  mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
         )
-        if median < poll_interval_sec * 1.5:
+        if median < poll_interval_sec * 1.5 and p75 < poll_interval_sec * 1.5:
             out(
                 "\n-> up_price reacts about as fast as our own polling resolution can even distinguish — "
                 "no usable internal lag visible at this measurement granularity. Consistent with the "
                 "contract's market makers re-quoting essentially in lockstep with spot."
             )
+        elif tail_n == 0:
+            out(
+                f"\n-> median/p75 are elevated but no individual reaction reached the "
+                f"{tail_threshold:.1f}s tail cutoff — likely polling-interval noise pushing the stats "
+                f"around with a small sample, not a real lag. Rerun with a longer --duration-sec before "
+                f"drawing a conclusion either way."
+            )
         else:
             out(
-                f"\n-> up_price appears to lag OKX's own spot by ~{median:.1f}s on average — POTENTIALLY "
-                f"exploitable: after a spot impulse, the side that just became more likely (UP after a spot "
-                f"jump up, DOWN after a drop) is briefly still priced at its OLD, cheaper probability, so "
-                f"buying it right after the spot impulse — before up_price catches up — would be +EV on "
-                f"average, IF this holds up. Caveats before building anything on this: (1) a handful of "
-                f"impulses isn't a lot of samples — rerun with a longer --duration-sec / during more "
-                f"volatile periods; (2) this still has to survive the slippage measured with "
-                f"--check-liquidity, and reacting within {median:.1f}s means your order also has to land "
-                f"within that window; (3) rollover-excluded impulses aren't counted here — a lag right "
-                f"around expiry could behave differently and wouldn't show up in this number."
+                f"\n-> mixed picture, NOT \"no lag\": median={median:.1f}s looks fast (most reactions are "
+                f"near-instant), but {tail_n}/{len(reacted)} ({tail_n / len(reacted) * 100:.0f}%) reactions "
+                f"took >= {tail_threshold:.1f}s to show up in up_price — a real, if inconsistent, tail of "
+                f"stale pricing rather than a uniformly fast one. This is the interesting part: after a spot "
+                f"impulse, the side that just became more likely (UP after a spot jump up, DOWN after a "
+                f"drop) is SOMETIMES still priced at its OLD, cheaper probability for several seconds — "
+                f"buying it in that window would be +EV, IF this tail is real and not just noise from a "
+                f"small sample. This is inherently an event-driven signal (react to a detected impulse and "
+                f"check whether up_price has caught up yet), not a blanket \"always faster\" edge — most of "
+                f"the time there's nothing there. Before building anything on this: (1) rerun with a longer "
+                f"--duration-sec to get more tail samples and confirm the {tail_n / len(reacted) * 100:.0f}% "
+                f"rate holds up rather than being a fluke of this one run; (2) check whether the tail cases "
+                f"cluster around specific conditions (e.g. near contract expiry, or during faster spot moves) "
+                f"— that's in the raw CSV (ts, spot_price, up_price, inst_id); (3) this still has to survive "
+                f"the slippage measured with --check-liquidity, and by definition you'd only know a reaction "
+                f"is 'slow' in hindsight — a live strategy would need to guess it's in the slow case before "
+                f"the window closes; (4) rollover-excluded impulses aren't counted here."
             )
     finally:
         if report_lines:
