@@ -209,8 +209,10 @@ async def check_liquidity(cfg, test_stake_usd: float = 20.0) -> None:
             asks, bids = b.get("asks", []), b.get("bids", [])
             print(f"  book depth: {len(bids)} bid levels / {len(asks)} ask levels")
 
+            # UP: walking real ask depth for a real BUY UP is a faithful
+            # simulation (you're buying exactly the instrument those asks
+            # are quoting).
             up_vwap, up_contracts, up_spent, up_full = _simulate_market_fill(asks, test_stake_usd)
-            down_vwap, down_contracts, down_spent, down_full = _simulate_market_fill(bids, test_stake_usd)
 
             print(f"  simulated ${test_stake_usd:.2f} market BUY UP:")
             if up_vwap is None:
@@ -225,17 +227,25 @@ async def check_liquidity(cfg, test_stake_usd: float = 20.0) -> None:
                 except (TypeError, ValueError, IndexError):
                     pass
 
-            print(f"  simulated ${test_stake_usd:.2f} market BUY DOWN (approx. — see caveat in docstring):")
-            if down_vwap is None:
+            # DOWN: bids are OTHER traders' resting buy-UP orders, not a
+            # depth of offers to sell you DOWN — walking multiple levels
+            # like we do for UP is not a faithful simulation (OKX doesn't
+            # publicly document how a DOWN/"no" order actually matches
+            # internally), and produces nonsense once the top level is
+            # thin. Report only the top-of-book estimate (1 - best_bid) as
+            # a best-case floor, explicitly NOT a depth simulation.
+            print(f"  DOWN top-of-book estimate (best case only — NOT a depth simulation, see docstring):")
+            if not bids:
                 print("    <no bid liquidity at all>")
             else:
-                down_cost = 1 - down_vwap
-                print(f"    implied_fill={down_cost:.4f}  contracts={down_contracts:.2f}  "
-                      f"spent=${down_spent:.2f}  {'(fully filled)' if down_full else '(BOOK RAN OUT — worse in reality)'}")
                 try:
-                    engine_price = round(1 - float(last), 4) if last not in (None, "") else round(1 - float(bids[0][0]), 4)
-                    slippage_pct = (down_cost - engine_price) / engine_price * 100
-                    print(f"    vs engine's simulated entry ({engine_price:.4f}): {slippage_pct:+.1f}% slippage")
+                    best_bid = float(bids[0][0])
+                    down_top_estimate = round(1 - best_bid, 4)
+                    engine_price = round(1 - float(last), 4) if last not in (None, "") else down_top_estimate
+                    diff_pct = ((down_top_estimate - engine_price) / engine_price * 100) if engine_price else float("nan")
+                    print(f"    best case ~{down_top_estimate:.4f} (vs engine's {engine_price:.4f}: {diff_pct:+.1f}%) "
+                          f"— a real fill only gets WORSE (higher) than this the deeper the order has to walk; "
+                          f"how much worse isn't something the public book tells us for this side.")
                 except (TypeError, ValueError, IndexError, ZeroDivisionError):
                     pass
 
