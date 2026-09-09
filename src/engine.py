@@ -254,9 +254,29 @@ class Engine:
                         logger.debug("%s: no signal at %dm-to-expiry for %s", s_cfg.name, window_min, series_id)
                         continue
 
-                    price = market.price_for(signal.direction)
                     inst_id = market.inst_id
-                    if price is None or not inst_id:
+                    if not inst_id:
+                        logger.warning(
+                            "%s wants to bet %s on %s but that market has no live "
+                            "quote yet — skipping.",
+                            s_cfg.name, signal.direction.value, series_id,
+                        )
+                        continue
+
+                    stake = round(wallet.balance * s_cfg.stake_fraction, 4)
+                    if stake <= 0.01:
+                        logger.warning("%s: wallet balance too low to stake ($%.2f) — skipping.", s_cfg.name, wallet.balance)
+                        continue
+
+                    # Honest expected fill for actually committing THIS
+                    # stake right now — walks the real order book for UP
+                    # (verified on live data: routinely 40-1000%+ away from
+                    # the naive last/mid price on these thin books), falls
+                    # back to top-of-book for DOWN (no public depth to walk
+                    # there) or to the naive price entirely if no book data
+                    # came back this tick. See EventMarket.fill_price_for.
+                    price = market.fill_price_for(signal.direction, stake)
+                    if price is None:
                         logger.warning(
                             "%s wants to bet %s on %s but that market has no live "
                             "quote yet — skipping.",
@@ -268,11 +288,6 @@ class Engine:
                             "%s: signal on %s rejected, price %.3f > max_coefficient %.3f",
                             s_cfg.name, series_id, price, s_cfg.max_coefficient,
                         )
-                        continue
-
-                    stake = round(wallet.balance * s_cfg.stake_fraction, 4)
-                    if stake <= 0.01:
-                        logger.warning("%s: wallet balance too low to stake ($%.2f) — skipping.", s_cfg.name, wallet.balance)
                         continue
 
                     trade = Trade(

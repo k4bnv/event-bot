@@ -26,6 +26,7 @@ from src.engine import Engine
 from src.logger import setup_logging
 from src.market_data import OkxMarketDataProvider
 from src.mock_market import MockMarketDataProvider
+from src.models import OrderBookLevel, simulate_market_fill
 from src.okx_client import OKXClient, OKXClientConfig
 from src.storage import Storage
 
@@ -81,40 +82,16 @@ async def discover_series(cfg) -> None:
         print("\nCopy the seriesId values you want into config.yaml -> okx.series_ids\n")
 
 
-def _simulate_market_fill(levels: list, budget_usd: float):
-    """Walk order-book price levels (each [priceStr, sizeStr, ...], BEST
-    PRICE FIRST — the order OKX's /market/books already returns them in)
-    simulating a market order that spends up to budget_usd. Each contract
-    at a level costs `price` (the 0.01-0.99 probability IS the per-contract
-    USDT cost), so a level of `size` contracts costs `price * size` USDT.
-
-    Returns (vwap_price, contracts_filled, usd_spent, fully_filled).
-    fully_filled=False means the visible book didn't have enough depth to
-    absorb budget_usd at all — a real order that size would walk even
-    deeper / partially fail, i.e. worse than what's computed here."""
-    contracts, spent = 0.0, 0.0
-    for level in levels:
+def _parse_book_levels(raw_levels: list) -> list[OrderBookLevel]:
+    """Convert OKX's raw [priceStr, sizeStr, ...] rows (from /market/books)
+    into OrderBookLevel objects, silently skipping any malformed row."""
+    out = []
+    for level in raw_levels:
         try:
-            price, size = float(level[0]), float(level[1])
+            out.append(OrderBookLevel(price=float(level[0]), size=float(level[1])))
         except (TypeError, ValueError, IndexError):
             continue
-        if price <= 0 or size <= 0:
-            continue
-        remaining_budget = budget_usd - spent
-        if remaining_budget <= 0:
-            break
-        level_cost = price * size
-        if level_cost <= remaining_budget:
-            contracts += size
-            spent += level_cost
-        else:
-            take = remaining_budget / price
-            contracts += take
-            spent += remaining_budget
-            break
-    fully_filled = spent >= budget_usd - 1e-6
-    vwap = (spent / contracts) if contracts > 0 else None
-    return vwap, contracts, spent, fully_filled
+    return out
 
 
 async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stake_usd: float) -> Optional[dict]:
@@ -177,12 +154,13 @@ async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stak
         return None
 
     b = book[0]
-    asks, bids = b.get("asks", []), b.get("bids", [])
+    asks, bids = _parse_book_levels(b.get("asks", [])), _parse_book_levels(b.get("bids", []))
     print(f"  book depth: {len(bids)} bid levels / {len(asks)} ask levels")
 
     # UP: walking real ask depth for a real BUY UP is a faithful
-    # simulation (you're buying exactly the instrument those asks quote).
-    up_vwap, up_contracts, up_spent, up_full = _simulate_market_fill(asks, test_stake_usd)
+    # simulation (you're buying exactly the instrument those asks quote) —
+    # same function the engine itself now uses (EventMarket.fill_price_for).
+    up_vwap, up_contracts, up_spent, up_full = simulate_market_fill(asks, test_stake_usd)
     up_slippage_pct = None
     print(f"  simulated ${test_stake_usd:.2f} market BUY UP:")
     if up_vwap is None:
@@ -191,7 +169,7 @@ async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stak
         print(f"    vwap_fill={up_vwap:.4f}  contracts={up_contracts:.2f}  "
               f"spent=${up_spent:.2f}  {'(fully filled)' if up_full else '(BOOK RAN OUT — worse in reality)'}")
         try:
-            engine_price = float(last) if last not in (None, "") else float(asks[0][0])
+            engine_price = float(last) if last not in (None, "") else asks[0].price
             up_slippage_pct = (up_vwap - engine_price) / engine_price * 100
             print(f"    vs engine's simulated entry ({engine_price:.4f}): {up_slippage_pct:+.1f}% slippage")
         except (TypeError, ValueError, IndexError):
@@ -209,7 +187,7 @@ async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stak
         print("    <no bid liquidity at all>")
     else:
         try:
-            best_bid = float(bids[0][0])
+            best_bid = bids[0].price
             down_top_estimate = round(1 - best_bid, 4)
             engine_price_down = round(1 - float(last), 4) if last not in (None, "") else down_top_estimate
             if engine_price_down:

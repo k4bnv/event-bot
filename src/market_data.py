@@ -172,6 +172,30 @@ class OkxMarketDataProvider(MarketDataProvider):
                 pass
         return None
 
+    async def _fetch_event_book(self, inst_id: str) -> Optional[OrderBookSnapshot]:
+        """This event contract's own live order book (not the underlying's)
+        — lets `EventMarket.fill_price_for` simulate a real VWAP fill
+        instead of trading at the naive last/mid price. Verified: on these
+        thin books, a real $20 order routinely fills 40-1000%+ away from
+        that naive price (see run.py's --check-liquidity and this repo's
+        history). None on any failure/empty response — callers must treat
+        that as "no depth data this tick", not an error, and fall back to
+        the naive price (EventMarket.fill_price_for already does this)."""
+        try:
+            book = await self.client.get_orderbook(inst_id, sz=20)
+        except (OKXAPIError, OKXNetworkError) as exc:
+            logger.warning("Failed fetching event contract book for %s: %s", inst_id, exc)
+            return None
+        if not book:
+            return None
+        raw = book[0]
+        try:
+            bids = [OrderBookLevel(price=float(p), size=float(s)) for p, s, *_ in raw.get("bids", [])]
+            asks = [OrderBookLevel(price=float(p), size=float(s)) for p, s, *_ in raw.get("asks", [])]
+        except (TypeError, ValueError):
+            return None
+        return OrderBookSnapshot(ts=time.time(), bids=bids, asks=asks)
+
     async def _refresh_series(self, series_id: str) -> None:
         markets = await self.client.get_event_markets(series_id=series_id, state="live")
         if not markets:
@@ -220,6 +244,7 @@ class OkxMarketDataProvider(MarketDataProvider):
         # for spot, applied to the event contract's own instId — its `last`
         # field IS the 0.01-0.99 probability.
         up_price = await self._fetch_event_price(inst_id)
+        book = await self._fetch_event_book(inst_id)
 
         # Verified against a live response (2026-09): OKX sends
         # floorStrike="0" as a PLACEHOLDER before the window's reference
@@ -256,6 +281,7 @@ class OkxMarketDataProvider(MarketDataProvider):
         self._active_markets[series_id] = EventMarket(
             series_id=series_id, method=method, inst_id=inst_id, expiry_ts=nearest_expiry,
             floor_strike=floor_strike, up_price=up_price, state=str(chosen.get("state", "live")),
+            book=book,
         )
 
     async def check_settlement(self, series_id: str, inst_id: str) -> Optional[Direction]:
