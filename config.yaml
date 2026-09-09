@@ -129,18 +129,23 @@ strategies:
     stake_fraction: 0.01
     funding_rate_threshold: 0.0003     # fraction; 0.0003 = 0.03% per funding interval
 
-  # Opt-in: costs money per call and needs an API key (see .env.example).
-  # Left disabled so cloning this repo never silently burns API credits.
+  # Costs money per call and needs an API key (see .env.example) — enabled
+  # here for this deployment (verified working end-to-end via
+  # `run.py --check-ai-prompt` first: max_tokens was raised 80->160 after
+  # the old value was found to truncate every JSON response mid-string,
+  # silently discarding every signal). If you clone this repo fresh
+  # without an API key set, it just logs one warning and skips every
+  # checkpoint — never crashes, never silently charges you.
   # Cost knobs tuned for a small prepaid balance (e.g. a few dollars):
   # entry_windows_min (1 checkpoint) x min_seconds_between_calls x
   # max_calls_per_day together cap this at <=100 calls/day; with
   # gemini-3.1-flash-lite's ~$0.25/M in + $1.50/M out and this prompt's size
-  # (~120 input + <=80 output tokens/call), that's well under $0.01/day —
-  # a $3 balance covers many months at these settings. Loosen
+  # (~120 input + <=160 output tokens/call), that's still well under
+  # $0.02/day — a $3 balance covers many months at these settings. Loosen
   # entry_windows_min/min_seconds_between_calls/max_calls_per_day once
   # you've watched a day of data/bot.log and are comfortable with the spend.
   ai_prompt:
-    enabled: false
+    enabled: true
     display_name: "G: AI Prompt"
     deposit_usd: 100
     entry_windows_min: [2]             # one checkpoint (closest to expiry) -> fewest paid calls
