@@ -9,7 +9,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
+from typing import Deque, Optional
 
 from .config import AppConfig
 from .market_data import MarketDataProvider
@@ -21,6 +23,26 @@ from .timing import EntryWindowManager
 from .wallet import VirtualWallet
 
 logger = logging.getLogger("okx_event_bot.engine")
+
+
+@dataclass
+class ActivityEvent:
+    """One line of the live per-strategy activity feed (Dashboard's
+    "Логи" tab) — every strategy evaluation at a due entry-window
+    checkpoint produces exactly one of these, plus one more when a trade
+    it opened later settles. In-memory only (a ring buffer on Engine, not
+    persisted to SQLite) — this is a live-observability feed, not part of
+    the durable trade history (that's data/bot.db, unaffected by this).
+    `kind` drives the dashboard's color-coding:
+      no_signal | opened | rejected | won | lost | unresolved
+    """
+    id: int
+    ts: float
+    strategy: str
+    series_id: str
+    window_min: Optional[int]
+    kind: str
+    message: str
 
 
 @dataclass
@@ -48,6 +70,14 @@ class Engine:
         self._last_settlement_check: dict[str, float] = {}
         self._last_snapshot_write = 0.0
         self._running = False
+
+        # Live activity feed for the dashboard's "Логи" tab — see
+        # ActivityEvent's docstring. maxlen bounds memory for a
+        # long-running process; the dashboard polls incrementally via
+        # activity_since(), so trimming here just caps how far back a
+        # freshly-opened tab (or one that was closed a while) can see.
+        self._activity: Deque[ActivityEvent] = deque(maxlen=1000)
+        self._activity_seq = 0
 
         self._build_wallets_and_strategies()
 
@@ -117,6 +147,8 @@ class Engine:
         self._close_strategies_soon(old_strategies)  # e.g. ai_prompt's old HTTP session
         self._settlement_attempts.clear()
         self._last_settlement_check.clear()
+        self._activity.clear()
+        self._log_activity("*", "*", None, "no_signal", "База сброшена — журнал активности очищен")
         self.timing = EntryWindowManager()
         self._last_snapshot_write = 0.0
         self.storage.reset()
@@ -254,6 +286,7 @@ class Engine:
                     signal = await strategy.evaluate(ctx)
                     if signal is None:
                         logger.debug("%s: no signal at %dm-to-expiry for %s", s_cfg.name, window_min, series_id)
+                        self._log_activity(s_cfg.name, series_id, window_min, "no_signal", "нет сигнала")
                         continue
 
                     inst_id = market.inst_id
@@ -263,11 +296,19 @@ class Engine:
                             "quote yet — skipping.",
                             s_cfg.name, signal.direction.value, series_id,
                         )
+                        self._log_activity(
+                            s_cfg.name, series_id, window_min, "rejected",
+                            f"{signal.direction.value.upper()} — нет живой котировки ({signal.reason})",
+                        )
                         continue
 
                     stake = round(wallet.balance * s_cfg.stake_fraction, 4)
                     if stake <= 0.01:
                         logger.warning("%s: wallet balance too low to stake ($%.2f) — skipping.", s_cfg.name, wallet.balance)
+                        self._log_activity(
+                            s_cfg.name, series_id, window_min, "rejected",
+                            f"баланс слишком мал для стейка (${wallet.balance:.2f})",
+                        )
                         continue
 
                     # Honest expected fill for actually committing THIS
@@ -284,11 +325,19 @@ class Engine:
                             "quote yet — skipping.",
                             s_cfg.name, signal.direction.value, series_id,
                         )
+                        self._log_activity(
+                            s_cfg.name, series_id, window_min, "rejected",
+                            f"{signal.direction.value.upper()} — нет цены исполнения ({signal.reason})",
+                        )
                         continue
                     if price > s_cfg.max_coefficient:
                         logger.debug(
                             "%s: signal on %s rejected, price %.3f > max_coefficient %.3f",
                             s_cfg.name, series_id, price, s_cfg.max_coefficient,
+                        )
+                        self._log_activity(
+                            s_cfg.name, series_id, window_min, "rejected",
+                            f"{signal.direction.value.upper()} @ {price:.3f} > лимит {s_cfg.max_coefficient:.2f} ({signal.reason})",
                         )
                         continue
 
@@ -309,6 +358,11 @@ class Engine:
                                     s_cfg.name, series_id, slippage_pct, s_cfg.max_slippage_pct,
                                     naive_price, price,
                                 )
+                                self._log_activity(
+                                    s_cfg.name, series_id, window_min, "rejected",
+                                    f"{signal.direction.value.upper()} — проскальзывание {slippage_pct:.0f}% "
+                                    f"> лимита {s_cfg.max_slippage_pct:.0f}% (котировка {naive_price:.3f} -> {price:.3f})",
+                                )
                                 continue
 
                     trade = Trade(
@@ -323,8 +377,16 @@ class Engine:
                             s_cfg.name, window_min, signal.direction.value.upper(), inst_id,
                             price, stake, signal.reason,
                         )
+                        self._log_activity(
+                            s_cfg.name, series_id, window_min, "opened",
+                            f"{signal.direction.value.upper()} @ {price:.3f} стейк ${stake:.2f} — {signal.reason}",
+                        )
                     else:
                         logger.warning("%s: could not afford stake $%.2f (balance $%.2f)", s_cfg.name, stake, wallet.balance)
+                        self._log_activity(
+                            s_cfg.name, series_id, window_min, "rejected",
+                            f"не хватило средств на стейк ${stake:.2f} (баланс ${wallet.balance:.2f})",
+                        )
 
     # -- settling trades --------------------------------------------------------------
     async def _settle_expired_trades(self) -> None:
@@ -366,6 +428,11 @@ class Engine:
                         wallet.mark_unresolved(trade)
                         self._settlement_attempts.pop(trade.id, None)
                         self._last_settlement_check.pop(trade.id, None)
+                        self._log_activity(
+                            trade.strategy, trade.series_id, trade.entry_window_min, "unresolved",
+                            f"{trade.direction.value.upper()} {trade.inst_id} — исход не подтверждён за "
+                            f"{attempts} попыток, стейк ${trade.stake_usd:.2f} возвращён",
+                        )
                     continue
 
                 self._settlement_attempts.pop(trade.id, None)
@@ -378,6 +445,30 @@ class Engine:
                     trade.id, trade.direction.value.upper(), trade.status.value,
                     trade.pnl_usd or 0.0, wallet.balance,
                 )
+                self._log_activity(
+                    trade.strategy, trade.series_id, trade.entry_window_min,
+                    "won" if outcome else "lost",
+                    f"{trade.direction.value.upper()} {trade.inst_id} -> pnl ${trade.pnl_usd or 0.0:+.2f}",
+                )
+
+    # -- live activity feed ----------------------------------------------------------
+    def _log_activity(self, strategy: str, series_id: str, window_min: Optional[int], kind: str, message: str) -> None:
+        self._activity_seq += 1
+        self._activity.append(ActivityEvent(
+            id=self._activity_seq, ts=time.time(), strategy=strategy,
+            series_id=series_id, window_min=window_min, kind=kind, message=message,
+        ))
+
+    def activity_since(self, since_id: int = 0, strategy: Optional[str] = None, limit: int = 300) -> list[ActivityEvent]:
+        """Events with id > since_id (oldest first), optionally filtered
+        to one strategy — the dashboard polls this incrementally (passing
+        back the highest id it's already rendered) instead of re-fetching
+        the whole buffer every tick."""
+        rows = [e for e in self._activity if e.id > since_id and (strategy is None or e.strategy == strategy)]
+        return rows[-limit:]
+
+    def latest_activity_id(self) -> int:
+        return self._activity_seq
 
     # -- persistence ---------------------------------------------------------------
     def _maybe_persist(self) -> None:

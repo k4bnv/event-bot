@@ -305,5 +305,114 @@ class SettleExpiredTradesThrottleTests(unittest.IsolatedAsyncioTestCase):
             engine.storage.close()
 
 
+class ActivityFeedTests(unittest.IsolatedAsyncioTestCase):
+    """The live per-strategy log (Dashboard's "Логи" tab) backing
+    ActivityEvent/_log_activity/activity_since — covers that opening,
+    rejecting, and settling a trade each produce the right `kind`, and
+    that incremental polling (since_id) and the strategy filter work."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    async def test_opened_trade_logs_opened_event(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=time.time() + 60, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            engine.strategy_instances["breakout_retest"].evaluate = (
+                lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
+            )
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _async_result(None)
+
+            await engine._open_due_trades()
+
+            events = engine.activity_since()
+            kinds = {e.kind for e in events if e.strategy == "breakout_retest"}
+            self.assertIn("opened", kinds)
+            opened = next(e for e in events if e.kind == "opened")
+            self.assertEqual(opened.strategy, "breakout_retest")
+            self.assertIn("UP", opened.message)
+
+            # the stubbed no-signal strategy logged its own event too
+            self.assertTrue(any(e.strategy == "mean_reversion" and e.kind == "no_signal" for e in events))
+            engine.storage.close()
+
+    async def test_rejected_by_max_coefficient_logs_rejected_event(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            s_cfg = next(s for s in engine.cfg.strategies if s.name == "breakout_retest")
+
+            # naive/fill price (0.9) sits above this strategy's max_coefficient (0.55)
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=time.time() + 60, floor_strike=50000.0, up_price=0.9, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            engine.strategy_instances["breakout_retest"].evaluate = (
+                lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
+            )
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _async_result(None)
+
+            await engine._open_due_trades()
+
+            self.assertEqual(engine.wallets["breakout_retest"].trades, [])
+            rejected = [e for e in engine.activity_since() if e.strategy == "breakout_retest"]
+            self.assertTrue(all(e.kind == "rejected" for e in rejected))
+            self.assertTrue(any(f"{s_cfg.max_coefficient:.2f}" in e.message for e in rejected))
+            engine.storage.close()
+
+    async def test_settle_logs_won_and_lost(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            wallet = engine.wallets["breakout_retest"]
+            t_won = Trade(
+                strategy="breakout_retest", entry_window_min=7, series_id="S", inst_id="I1",
+                direction=Direction.UP, entry_price=0.4, stake_usd=10.0, contracts=25.0,
+                opened_ts=time.time() - 120, expiry_ts=time.time() - 60,
+            )
+            t_lost = Trade(
+                strategy="breakout_retest", entry_window_min=7, series_id="S", inst_id="I2",
+                direction=Direction.DOWN, entry_price=0.4, stake_usd=10.0, contracts=25.0,
+                opened_ts=time.time() - 120, expiry_ts=time.time() - 60,
+            )
+            wallet.open_trade(t_won)
+            wallet.open_trade(t_lost)
+
+            async def settle(series_id, inst_id):
+                return Direction.UP  # t_won's direction wins, t_lost's loses
+
+            engine.provider.check_settlement = settle
+            await engine._settle_expired_trades()
+
+            events = engine.activity_since()
+            self.assertTrue(any(e.kind == "won" and "I1" in e.message for e in events))
+            self.assertTrue(any(e.kind == "lost" and "I2" in e.message for e in events))
+            engine.storage.close()
+
+    async def test_activity_since_filters_by_id_and_strategy(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            engine._log_activity("breakout_retest", "S", 7, "no_signal", "первое")
+            marker_id = engine.latest_activity_id()
+            engine._log_activity("mean_reversion", "S", 2, "no_signal", "второе")
+            engine._log_activity("breakout_retest", "S", 7, "opened", "третье")
+
+            since = engine.activity_since(since_id=marker_id)
+            self.assertEqual([e.message for e in since], ["второе", "третье"])
+
+            only_breakout = engine.activity_since(strategy="breakout_retest")
+            self.assertEqual([e.message for e in only_breakout], ["первое", "третье"])
+            engine.storage.close()
+
+
 if __name__ == "__main__":
     unittest.main()

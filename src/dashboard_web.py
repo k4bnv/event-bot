@@ -210,6 +210,46 @@ INDEX_HTML = """<!doctype html>
   .pager button:hover:not(:disabled) { background:#1f232b; }
   .pager button:disabled { opacity:0.4; cursor:default; }
   .reason-cell { max-width:220px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left !important; }
+  .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3ddc84;
+    margin-left:6px; vertical-align:middle; animation: live-pulse 1.6s ease-in-out infinite; }
+  @keyframes live-pulse { 0%,100% { opacity:1; } 50% { opacity:0.25; } }
+  #clearLogsBtn { background:#171a21; color:#9aa0a6; border:1px solid #23262e; border-radius:6px;
+    padding:5px 12px; font-size:12px; cursor:pointer; }
+  #clearLogsBtn:hover { background:#1f232b; }
+  .activity-log { display:flex; flex-direction:column; gap:2px; max-height:70vh; overflow-y:auto;
+    font-size:12.5px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .log-line { display:grid; grid-template-columns: 66px 108px 34px 84px 1fr; gap:8px; align-items:baseline;
+    padding:4px 8px; border-radius:4px; border-left:3px solid transparent; }
+  .log-line:nth-child(odd) { background:#14161c; }
+  .log-time { color:#6b7280; white-space:nowrap; }
+  .log-strategy { color:#9aa0a6; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .log-window { color:#6b7280; }
+  .log-kind { font-weight:600; white-space:nowrap; }
+  .log-msg { color:#c7cbd1; word-break:break-word; }
+  .log-empty { color:#6b7280; padding:14px 8px; font-family:inherit; }
+  /* entries/signals get a distinct, louder treatment than routine "no signal" checks */
+  .log-no_signal { border-left-color:transparent; opacity:0.55; }
+  .log-no_signal .log-kind { color:#6b7280; }
+  .log-opened { border-left-color:#7fc7ff; background:rgba(127,199,255,0.08) !important; }
+  .log-opened .log-kind { color:#7fc7ff; }
+  .log-opened .log-msg { color:#e6e6e6; }
+  .log-rejected { border-left-color:#ffb84d; }
+  .log-rejected .log-kind { color:#ffb84d; }
+  .log-won { border-left-color:#3ddc84; background:rgba(61,220,132,0.08) !important; }
+  .log-won .log-kind { color:#3ddc84; }
+  .log-won .log-msg { color:#e6e6e6; }
+  .log-lost { border-left-color:#ff6b6b; background:rgba(255,107,107,0.08) !important; }
+  .log-lost .log-kind { color:#ff6b6b; }
+  .log-lost .log-msg { color:#e6e6e6; }
+  .log-unresolved { border-left-color:#ffd166; }
+  .log-unresolved .log-kind { color:#ffd166; }
+  @media (max-width: 640px) {
+    .log-line { grid-template-columns: 56px 1fr; grid-template-areas: "time strategy" "kind msg" "window window";
+      row-gap:2px; }
+    .log-time { grid-area:time; } .log-strategy { grid-area:strategy; }
+    .log-window { grid-area:window; font-size:11px; }
+    .log-kind { grid-area:kind; } .log-msg { grid-area:msg; }
+  }
 </style>
 </head>
 <body>
@@ -226,6 +266,7 @@ INDEX_HTML = """<!doctype html>
   <div class="tabs">
     <button id="tabDashboardBtn" class="tab-btn active" onclick="showTab('dashboard')">Дашборд</button>
     <button id="tabAnalyticsBtn" class="tab-btn" onclick="showTab('analytics')">Аналитика</button>
+    <button id="tabLogsBtn" class="tab-btn" onclick="showTab('logs')">Логи</button>
     <button id="tabSettingsBtn" class="tab-btn" onclick="showTab('settings')">Настройки стратегий</button>
   </div>
 
@@ -254,6 +295,19 @@ INDEX_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id="logsView" style="display:none;">
+    <div class="card">
+      <h3>Логи стратегий <span id="logsLiveDot" class="live-dot" title="обновляется в реальном времени"></span></h3>
+      <div class="analytics-controls">
+        <label>Стратегия:
+          <select id="logsFilter" onchange="renderActivityLog()"><option value="">Все</option></select>
+        </label>
+        <button id="clearLogsBtn" onclick="clearActivityView()">Очистить вид</button>
+      </div>
+      <div id="activityLog" class="activity-log">loading…</div>
+    </div>
+  </div>
+
   <div id="settingsView" style="display:none;">
     <div id="strategyCards">loading…</div>
     <button id="applyStrategyBtn" onclick="applyStrategySettings()">Применить (сброс всех данных)</button>
@@ -266,6 +320,14 @@ function cls(v){ return v>0?'pos':(v<0?'neg':''); }
 let currentTab = 'dashboard';
 let strategySettingsLoaded = false;
 let tradesFilterLoaded = false;
+let logsFilterLoaded = false;
+let activityEvents = [];      // client-side ring buffer, newest first
+let activitySinceId = 0;
+const ACTIVITY_MAX_BUFFER = 400;
+const ACTIVITY_KIND_LABELS = {
+  no_signal: 'нет сигнала', opened: 'ВХОД', rejected: 'отклонено',
+  won: 'ПОБЕДА', lost: 'ПРОИГРЫШ', unresolved: 'не подтверждено',
+};
 let tradesPage = 0;
 let tradesSortBy = 'closed_ts';
 let tradesSortDir = 'desc';
@@ -291,15 +353,79 @@ function showTab(tab){
   currentTab = tab;
   document.getElementById('dashboardView').style.display = tab === 'dashboard' ? '' : 'none';
   document.getElementById('analyticsView').style.display = tab === 'analytics' ? '' : 'none';
+  document.getElementById('logsView').style.display = tab === 'logs' ? '' : 'none';
   document.getElementById('settingsView').style.display = tab === 'settings' ? '' : 'none';
   document.getElementById('tabDashboardBtn').classList.toggle('active', tab === 'dashboard');
   document.getElementById('tabAnalyticsBtn').classList.toggle('active', tab === 'analytics');
+  document.getElementById('tabLogsBtn').classList.toggle('active', tab === 'logs');
   document.getElementById('tabSettingsBtn').classList.toggle('active', tab === 'settings');
   if (tab === 'settings' && !strategySettingsLoaded) loadStrategySettings();
   if (tab === 'analytics') {
     if (!tradesFilterLoaded) loadTradesFilterOptions();
     loadTradesTable();
   }
+  if (tab === 'logs') {
+    if (!logsFilterLoaded) loadLogsFilterOptions();
+    renderActivityLog();
+  }
+}
+
+async function loadLogsFilterOptions(){
+  const r = await fetch('/api/strategies');
+  const strategies = await r.json();
+  const sel = document.getElementById('logsFilter');
+  for (const s of strategies) {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = s.display_name;
+    sel.appendChild(opt);
+  }
+  logsFilterLoaded = true;
+}
+
+// Polled from tick() every refresh cycle regardless of which tab is
+// active — the payload is tiny (only events newer than activitySinceId)
+// so the log tab has data ready the instant you switch to it, instead of
+// starting from empty.
+async function loadActivity(){
+  const r = await fetch(`/api/activity?since_id=${activitySinceId}`);
+  const d = await r.json();
+  if (d.events && d.events.length) {
+    activityEvents = d.events.slice().reverse().concat(activityEvents).slice(0, ACTIVITY_MAX_BUFFER);
+  }
+  activitySinceId = d.latest_id;
+  if (currentTab === 'logs') renderActivityLog();
+}
+
+function renderActivityLog(){
+  const filter = document.getElementById('logsFilter').value;
+  const rows = filter ? activityEvents.filter(e => e.strategy === filter) : activityEvents;
+  if (!rows.length) {
+    document.getElementById('activityLog').innerHTML =
+      '<div class="log-empty">пока пусто — ждём следующего чекпоинта входа</div>';
+    return;
+  }
+  const html = rows.map(e => {
+    const t = new Date(e.ts * 1000).toLocaleTimeString();
+    const win = e.window_min != null ? `${e.window_min}м` : '';
+    const label = ACTIVITY_KIND_LABELS[e.kind] || e.kind;
+    return `<div class="log-line log-${e.kind}">
+      <span class="log-time">${t}</span>
+      <span class="log-strategy">${escapeHtml(e.display_name)}</span>
+      <span class="log-window">${win}</span>
+      <span class="log-kind">${label}</span>
+      <span class="log-msg">${escapeHtml(e.message)}</span>
+    </div>`;
+  }).join('');
+  document.getElementById('activityLog').innerHTML = html;
+}
+
+function clearActivityView(){
+  // Clears only what's rendered client-side — a fresh poll will still
+  // pull in anything new; this is "tidy the screen", not "wipe history"
+  // (that's the Reset DB button, a different, destructive action).
+  activityEvents = [];
+  renderActivityLog();
 }
 
 async function loadTradesFilterOptions(){
@@ -570,6 +696,7 @@ async function applyStrategySettings(){
 }
 
 async function tick(){
+  loadActivity();  // fire-and-forget — polled every tick regardless of active tab, see its own docstring
   const r = await fetch('/api/state');
   const d = await r.json();
 
@@ -885,6 +1012,31 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
         return StreamingResponse(
             iter([buf.getvalue()]), media_type="text/csv",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    @app.get("/api/activity")
+    async def get_activity(since_id: int = 0, strategy: Optional[str] = None, limit: int = 300) -> JSONResponse:
+        """Live per-strategy activity feed for the Dashboard's "Логи" tab —
+        every strategy evaluation at a due entry-window checkpoint (signal
+        or none), every rejection reason, and every settlement, as they
+        happen. In-memory only (Engine._activity, not SQLite) — poll with
+        `since_id` set to the previous response's `latest_id` to fetch just
+        what's new instead of re-sending the whole buffer every time."""
+        limit = min(max(limit, 1), 1000)
+        events = engine.activity_since(since_id=since_id, strategy=strategy, limit=limit)
+        return JSONResponse(
+            {
+                "events": [
+                    {
+                        "id": e.id, "ts": e.ts, "strategy": e.strategy,
+                        "display_name": display_names.get(e.strategy, e.strategy),
+                        "series_id": e.series_id, "window_min": e.window_min,
+                        "kind": e.kind, "message": e.message,
+                    }
+                    for e in events
+                ],
+                "latest_id": engine.latest_activity_id(),
+            }
         )
 
     return app
