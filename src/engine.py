@@ -612,176 +612,208 @@ class Engine:
                     series_id, market.expiry_ts, s_cfg.name, remaining, s_cfg.entry_windows_min
                 )
                 for window_min in due_windows:
-                    # Each entry checkpoint has its own wallet (see
-                    # _wallet_key) — looked up per window_min, not once per
-                    # strategy, since that's exactly the isolation this
-                    # split is for: "12 мин" stakes/wins/loses out of its
-                    # own pool, completely independent of "2 мин"'s.
-                    # dynamic_timing strategies collapse to their one
-                    # shared wallet instead (see _wallet_key).
-                    wallet_key_window = None if s_cfg.dynamic_timing else window_min
-                    wallet = self.wallets[self._wallet_key(s_cfg.name, wallet_key_window)]
-                    already_open_this_market = any(
-                        t.series_id == series_id and t.expiry_ts == market.expiry_ts
-                        for t in wallet.open_trades()
+                    try:
+                        await self._evaluate_one_checkpoint(s_cfg, strategy, series_id, market, remaining, window_min, now)
+                    except Exception:
+                        # One strategy's bug (or an unexpected data shape
+                        # from a real exchange response) must never
+                        # silently starve every OTHER strategy/checkpoint
+                        # due this same tick — without this, an uncaught
+                        # exception here aborted the WHOLE
+                        # _open_due_trades() loop, skipping every
+                        # checkpoint still to come (and, if the same bug
+                        # recurred every tick, forever — run_forever()'s
+                        # own catch-all only protects the process from
+                        # crashing, not other strategies from being
+                        # starved).
+                        logger.exception(
+                            "Error evaluating %s on %s @ %dm-to-expiry — skipping this checkpoint only.",
+                            s_cfg.name, series_id, window_min,
+                        )
+
+    async def _evaluate_one_checkpoint(
+        self, s_cfg, strategy: BaseStrategy, series_id: str, market, remaining: float, window_min: int, now: float,
+    ) -> None:
+        """One (strategy, series, checkpoint) evaluation — pulled out of
+        _open_due_trades()'s innermost loop so the CALLER can wrap it in a
+        try/except (see there) without an enormous indented block. An
+        exception raised anywhere in here — a strategy's own bug, or an
+        unexpected data shape from a real exchange response neither this
+        bot nor the strategy anticipated — must never silently starve
+        every OTHER checkpoint due in the same tick; that isolation lives
+        in the caller, not here.
+        """
+        # Each entry checkpoint has its own wallet (see
+        # _wallet_key) — looked up per window_min, not once per
+        # strategy, since that's exactly the isolation this
+        # split is for: "12 мин" stakes/wins/loses out of its
+        # own pool, completely independent of "2 мин"'s.
+        # dynamic_timing strategies collapse to their one
+        # shared wallet instead (see _wallet_key).
+        wallet_key_window = None if s_cfg.dynamic_timing else window_min
+        wallet = self.wallets[self._wallet_key(s_cfg.name, wallet_key_window)]
+        already_open_this_market = any(
+            t.series_id == series_id and t.expiry_ts == market.expiry_ts
+            for t in wallet.open_trades()
+        )
+        ctx = StrategyContext(
+            price_history=self.provider.btc_price_history(),
+            orderbook=self.provider.btc_orderbook(),
+            remaining_sec=remaining, window_min=window_min,
+            market=market, funding_rate=self.provider.funding_rate(),
+            previous_outcome=self._previous_outcome.get(series_id),
+            already_open_this_market=already_open_this_market,
+            trade_prints=self.provider.btc_trade_prints(),
+            orderbook_history=self.provider.btc_orderbook_history(),
+        )
+        signal = await strategy.evaluate(ctx)
+        if signal is None:
+            # A dynamic_timing strategy scanning a dense grid
+            # returns None on EVERY checkpoint after the one
+            # where it already committed to this market (see
+            # already_open_this_market/adaptive_timing) — that's
+            # a completely different thing from genuinely
+            # finding no edge, and logging both as plain
+            # "no_signal" would quietly mislabel a real chunk of
+            # this strategy's negative examples for anyone
+            # training on checkpoint_features later. Only
+            # applies to dynamic_timing strategies: a normal
+            # strategy already having an open trade in this
+            # market (e.g. its "12 мин" checkpoint fired earlier)
+            # says nothing about whether its "2 мин" checkpoint
+            # — an independent bet with its own wallet — has a
+            # real edge or not.
+            if s_cfg.dynamic_timing and already_open_this_market:
+                decision, message = "skipped_already_positioned", "уже есть позиция в этом рынке"
+            else:
+                decision, message = "no_signal", "нет сигнала"
+            logger.debug("%s: %s at %dm-to-expiry for %s", s_cfg.name, message, window_min, series_id)
+            self._log_activity(s_cfg.name, series_id, window_min, "no_signal", message)
+            self._record_checkpoint_features(s_cfg, series_id, ctx, None, decision)
+            return
+
+        inst_id = market.inst_id
+        if not inst_id:
+            logger.warning(
+                "%s wants to bet %s on %s but that market has no live "
+                "quote yet — skipping.",
+                s_cfg.name, signal.direction.value, series_id,
+            )
+            self._log_activity(
+                s_cfg.name, series_id, window_min, "rejected",
+                f"{signal.direction.value.upper()} — нет живой котировки ({signal.reason})",
+            )
+            self._record_checkpoint_features(s_cfg, series_id, ctx, signal, "rejected_no_quote")
+            return
+
+        stake = round(wallet.balance * s_cfg.stake_fraction, 4)
+        if stake <= 0.01:
+            logger.warning("%s: wallet balance too low to stake ($%.2f) — skipping.", s_cfg.name, wallet.balance)
+            self._log_activity(
+                s_cfg.name, series_id, window_min, "rejected",
+                f"баланс слишком мал для стейка (${wallet.balance:.2f})",
+            )
+            self._record_checkpoint_features(
+                s_cfg, series_id, ctx, signal, "rejected_low_balance", stake_usd=stake,
+            )
+            return
+
+        # Honest expected fill for actually committing THIS
+        # stake right now — walks the real order book for UP
+        # (verified on live data: routinely 40-1000%+ away from
+        # the naive last/mid price on these thin books), falls
+        # back to top-of-book for DOWN (no public depth to walk
+        # there) or to the naive price entirely if no book data
+        # came back this tick. See EventMarket.fill_price_for.
+        price = market.fill_price_for(signal.direction, stake)
+        if price is None:
+            logger.warning(
+                "%s wants to bet %s on %s but that market has no live "
+                "quote yet — skipping.",
+                s_cfg.name, signal.direction.value, series_id,
+            )
+            self._log_activity(
+                s_cfg.name, series_id, window_min, "rejected",
+                f"{signal.direction.value.upper()} — нет цены исполнения ({signal.reason})",
+            )
+            self._record_checkpoint_features(
+                s_cfg, series_id, ctx, signal, "rejected_no_fill_price", stake_usd=stake,
+            )
+            return
+        if price > s_cfg.max_coefficient:
+            logger.debug(
+                "%s: signal on %s rejected, price %.3f > max_coefficient %.3f",
+                s_cfg.name, series_id, price, s_cfg.max_coefficient,
+            )
+            self._log_activity(
+                s_cfg.name, series_id, window_min, "rejected",
+                f"{signal.direction.value.upper()} @ {price:.3f} > лимит {s_cfg.max_coefficient:.2f} ({signal.reason})",
+            )
+            self._record_checkpoint_features(
+                s_cfg, series_id, ctx, signal, "rejected_max_coefficient",
+                fill_price=price, stake_usd=stake,
+            )
+            return
+
+        # Paper-trading analog of the "max slippage" guard a
+        # real OKX order lets you set before it refuses to
+        # fill: reject if the honest price is more than
+        # max_slippage_pct WORSE than the naive quote, even if
+        # it's still under max_coefficient's absolute ceiling.
+        # None (default/unset) = no limit, old behavior.
+        if s_cfg.max_slippage_pct is not None:
+            naive_price = market.price_for(signal.direction)
+            if naive_price:
+                slippage_pct = (price - naive_price) / naive_price * 100
+                if slippage_pct > s_cfg.max_slippage_pct:
+                    logger.debug(
+                        "%s: signal on %s rejected, slippage %.1f%% > max_slippage_pct %.1f%% "
+                        "(quoted %.4f, real fill %.4f)",
+                        s_cfg.name, series_id, slippage_pct, s_cfg.max_slippage_pct,
+                        naive_price, price,
                     )
-                    ctx = StrategyContext(
-                        price_history=self.provider.btc_price_history(),
-                        orderbook=self.provider.btc_orderbook(),
-                        remaining_sec=remaining, window_min=window_min,
-                        market=market, funding_rate=self.provider.funding_rate(),
-                        previous_outcome=self._previous_outcome.get(series_id),
-                        already_open_this_market=already_open_this_market,
-                        trade_prints=self.provider.btc_trade_prints(),
-                        orderbook_history=self.provider.btc_orderbook_history(),
+                    self._log_activity(
+                        s_cfg.name, series_id, window_min, "rejected",
+                        f"{signal.direction.value.upper()} — проскальзывание {slippage_pct:.0f}% "
+                        f"> лимита {s_cfg.max_slippage_pct:.0f}% (котировка {naive_price:.3f} -> {price:.3f})",
                     )
-                    signal = await strategy.evaluate(ctx)
-                    if signal is None:
-                        # A dynamic_timing strategy scanning a dense grid
-                        # returns None on EVERY checkpoint after the one
-                        # where it already committed to this market (see
-                        # already_open_this_market/adaptive_timing) — that's
-                        # a completely different thing from genuinely
-                        # finding no edge, and logging both as plain
-                        # "no_signal" would quietly mislabel a real chunk of
-                        # this strategy's negative examples for anyone
-                        # training on checkpoint_features later. Only
-                        # applies to dynamic_timing strategies: a normal
-                        # strategy already having an open trade in this
-                        # market (e.g. its "12 мин" checkpoint fired earlier)
-                        # says nothing about whether its "2 мин" checkpoint
-                        # — an independent bet with its own wallet — has a
-                        # real edge or not.
-                        if s_cfg.dynamic_timing and already_open_this_market:
-                            decision, message = "skipped_already_positioned", "уже есть позиция в этом рынке"
-                        else:
-                            decision, message = "no_signal", "нет сигнала"
-                        logger.debug("%s: %s at %dm-to-expiry for %s", s_cfg.name, message, window_min, series_id)
-                        self._log_activity(s_cfg.name, series_id, window_min, "no_signal", message)
-                        self._record_checkpoint_features(s_cfg, series_id, ctx, None, decision)
-                        continue
-
-                    inst_id = market.inst_id
-                    if not inst_id:
-                        logger.warning(
-                            "%s wants to bet %s on %s but that market has no live "
-                            "quote yet — skipping.",
-                            s_cfg.name, signal.direction.value, series_id,
-                        )
-                        self._log_activity(
-                            s_cfg.name, series_id, window_min, "rejected",
-                            f"{signal.direction.value.upper()} — нет живой котировки ({signal.reason})",
-                        )
-                        self._record_checkpoint_features(s_cfg, series_id, ctx, signal, "rejected_no_quote")
-                        continue
-
-                    stake = round(wallet.balance * s_cfg.stake_fraction, 4)
-                    if stake <= 0.01:
-                        logger.warning("%s: wallet balance too low to stake ($%.2f) — skipping.", s_cfg.name, wallet.balance)
-                        self._log_activity(
-                            s_cfg.name, series_id, window_min, "rejected",
-                            f"баланс слишком мал для стейка (${wallet.balance:.2f})",
-                        )
-                        self._record_checkpoint_features(
-                            s_cfg, series_id, ctx, signal, "rejected_low_balance", stake_usd=stake,
-                        )
-                        continue
-
-                    # Honest expected fill for actually committing THIS
-                    # stake right now — walks the real order book for UP
-                    # (verified on live data: routinely 40-1000%+ away from
-                    # the naive last/mid price on these thin books), falls
-                    # back to top-of-book for DOWN (no public depth to walk
-                    # there) or to the naive price entirely if no book data
-                    # came back this tick. See EventMarket.fill_price_for.
-                    price = market.fill_price_for(signal.direction, stake)
-                    if price is None:
-                        logger.warning(
-                            "%s wants to bet %s on %s but that market has no live "
-                            "quote yet — skipping.",
-                            s_cfg.name, signal.direction.value, series_id,
-                        )
-                        self._log_activity(
-                            s_cfg.name, series_id, window_min, "rejected",
-                            f"{signal.direction.value.upper()} — нет цены исполнения ({signal.reason})",
-                        )
-                        self._record_checkpoint_features(
-                            s_cfg, series_id, ctx, signal, "rejected_no_fill_price", stake_usd=stake,
-                        )
-                        continue
-                    if price > s_cfg.max_coefficient:
-                        logger.debug(
-                            "%s: signal on %s rejected, price %.3f > max_coefficient %.3f",
-                            s_cfg.name, series_id, price, s_cfg.max_coefficient,
-                        )
-                        self._log_activity(
-                            s_cfg.name, series_id, window_min, "rejected",
-                            f"{signal.direction.value.upper()} @ {price:.3f} > лимит {s_cfg.max_coefficient:.2f} ({signal.reason})",
-                        )
-                        self._record_checkpoint_features(
-                            s_cfg, series_id, ctx, signal, "rejected_max_coefficient",
-                            fill_price=price, stake_usd=stake,
-                        )
-                        continue
-
-                    # Paper-trading analog of the "max slippage" guard a
-                    # real OKX order lets you set before it refuses to
-                    # fill: reject if the honest price is more than
-                    # max_slippage_pct WORSE than the naive quote, even if
-                    # it's still under max_coefficient's absolute ceiling.
-                    # None (default/unset) = no limit, old behavior.
-                    if s_cfg.max_slippage_pct is not None:
-                        naive_price = market.price_for(signal.direction)
-                        if naive_price:
-                            slippage_pct = (price - naive_price) / naive_price * 100
-                            if slippage_pct > s_cfg.max_slippage_pct:
-                                logger.debug(
-                                    "%s: signal on %s rejected, slippage %.1f%% > max_slippage_pct %.1f%% "
-                                    "(quoted %.4f, real fill %.4f)",
-                                    s_cfg.name, series_id, slippage_pct, s_cfg.max_slippage_pct,
-                                    naive_price, price,
-                                )
-                                self._log_activity(
-                                    s_cfg.name, series_id, window_min, "rejected",
-                                    f"{signal.direction.value.upper()} — проскальзывание {slippage_pct:.0f}% "
-                                    f"> лимита {s_cfg.max_slippage_pct:.0f}% (котировка {naive_price:.3f} -> {price:.3f})",
-                                )
-                                self._record_checkpoint_features(
-                                    s_cfg, series_id, ctx, signal, "rejected_max_slippage",
-                                    fill_price=price, stake_usd=stake,
-                                )
-                                continue
-
-                    trade = Trade(
-                        strategy=s_cfg.name, entry_window_min=window_min, series_id=series_id,
-                        inst_id=inst_id, direction=signal.direction, entry_price=price,
-                        stake_usd=stake, contracts=stake / price, opened_ts=now,
-                        expiry_ts=market.expiry_ts, reason=signal.reason,
+                    self._record_checkpoint_features(
+                        s_cfg, series_id, ctx, signal, "rejected_max_slippage",
+                        fill_price=price, stake_usd=stake,
                     )
-                    if wallet.open_trade(trade):
-                        logger.info(
-                            "OPEN  [%s|%dm] %s %s @ %.3f stake=$%.2f (%s)",
-                            s_cfg.name, window_min, signal.direction.value.upper(), inst_id,
-                            price, stake, signal.reason,
-                        )
-                        self._log_activity(
-                            s_cfg.name, series_id, window_min, "opened",
-                            f"{signal.direction.value.upper()} @ {price:.3f} стейк ${stake:.2f} — {signal.reason}",
-                        )
-                        self._record_checkpoint_features(
-                            s_cfg, series_id, ctx, signal, "opened",
-                            fill_price=price, stake_usd=stake, trade_id=trade.id,
-                        )
-                    else:
-                        logger.warning("%s: could not afford stake $%.2f (balance $%.2f)", s_cfg.name, stake, wallet.balance)
-                        self._log_activity(
-                            s_cfg.name, series_id, window_min, "rejected",
-                            f"не хватило средств на стейк ${stake:.2f} (баланс ${wallet.balance:.2f})",
-                        )
-                        self._record_checkpoint_features(
-                            s_cfg, series_id, ctx, signal, "rejected_insufficient_funds",
-                            fill_price=price, stake_usd=stake,
-                        )
+                    return
+
+        trade = Trade(
+            strategy=s_cfg.name, entry_window_min=window_min, series_id=series_id,
+            inst_id=inst_id, direction=signal.direction, entry_price=price,
+            stake_usd=stake, contracts=stake / price, opened_ts=now,
+            expiry_ts=market.expiry_ts, reason=signal.reason,
+        )
+        if wallet.open_trade(trade):
+            logger.info(
+                "OPEN  [%s|%dm] %s %s @ %.3f stake=$%.2f (%s)",
+                s_cfg.name, window_min, signal.direction.value.upper(), inst_id,
+                price, stake, signal.reason,
+            )
+            self._log_activity(
+                s_cfg.name, series_id, window_min, "opened",
+                f"{signal.direction.value.upper()} @ {price:.3f} стейк ${stake:.2f} — {signal.reason}",
+            )
+            self._record_checkpoint_features(
+                s_cfg, series_id, ctx, signal, "opened",
+                fill_price=price, stake_usd=stake, trade_id=trade.id,
+            )
+        else:
+            logger.warning("%s: could not afford stake $%.2f (balance $%.2f)", s_cfg.name, stake, wallet.balance)
+            self._log_activity(
+                s_cfg.name, series_id, window_min, "rejected",
+                f"не хватило средств на стейк ${stake:.2f} (баланс ${wallet.balance:.2f})",
+            )
+            self._record_checkpoint_features(
+                s_cfg, series_id, ctx, signal, "rejected_insufficient_funds",
+                fill_price=price, stake_usd=stake,
+            )
+
 
     # -- settling trades --------------------------------------------------------------
     async def _settle_expired_trades(self) -> None:

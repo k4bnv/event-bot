@@ -492,6 +492,86 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
             engine.storage.close()
 
 
+class PerCheckpointExceptionIsolationTests(unittest.IsolatedAsyncioTestCase):
+    """One strategy's bug (or an unexpected data shape from a real
+    exchange response) must never silently starve every OTHER strategy/
+    checkpoint due in the same tick. Before _evaluate_one_checkpoint was
+    pulled out with its own try/except in _open_due_trades, an uncaught
+    exception from ONE strategy aborted the whole loop for that tick —
+    and, if the bug recurred every tick (a persistent issue, not a
+    one-off), every strategy configured after the buggy one in
+    config.yaml would be starved for as long as the process ran, with no
+    exception ever visible to THEM to explain why."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    async def test_one_strategys_exception_does_not_block_the_other(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+            _prime_entry_window(engine, series_id, expiry_ts, "mean_reversion")
+
+            def boom(ctx):
+                raise RuntimeError("simulated bug in this strategy's evaluate()")
+
+            engine.strategy_instances["breakout_retest"].evaluate = boom
+            engine.strategy_instances["mean_reversion"].evaluate = (
+                lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
+            )
+
+            await engine._open_due_trades()  # must not raise
+
+            # breakout_retest's exception logged a checkpoint_features row?
+            # No — it never got that far. What matters is mean_reversion,
+            # listed AFTER breakout_retest in cfg.strategies, still ran.
+            self.assertEqual(len(engine.wallet_for("mean_reversion", 2).trades), 1)
+            engine.storage.close()
+
+    async def test_one_checkpoints_exception_does_not_block_a_sibling_checkpoint(self):
+        # Same strategy, two checkpoints due in the SAME _open_due_trades()
+        # call: prime the window's "start" above both 12 and 7 (unlike
+        # _prime_entry_window's hardcoded 5-minute priming, which would
+        # make "12" structurally unreachable — see timing.py), then jump
+        # straight to ~6.9 minutes remaining so both cross at once. The
+        # first one raising must not stop the second's own wallet from
+        # ever getting evaluated.
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))
+            series_id = engine.cfg.okx.series_ids[0]
+            expiry_ts = time.time() + 60 * 6.9
+            market = EventMarket(
+                series_id=series_id, method="price_up_down", inst_id="TEST-INST",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
+            )
+            engine.provider._active_markets[series_id] = market
+            engine.timing.due_windows(series_id, expiry_ts, "breakout_retest", 900.0, [12, 7, 2])
+            engine.strategy_instances["mean_reversion"].evaluate = lambda ctx: _async_result(None)
+
+            def flaky(ctx):
+                if ctx.window_min == 12:
+                    raise RuntimeError("simulated bug, only on the '12' checkpoint")
+                return _async_result(Signal(direction=Direction.UP, reason="test"))
+
+            engine.strategy_instances["breakout_retest"].evaluate = flaky
+
+            await engine._open_due_trades()  # must not raise despite "12" throwing
+
+            self.assertEqual(engine.wallet_for("breakout_retest", 12).trades, [])  # never got past the exception
+            self.assertEqual(len(engine.wallet_for("breakout_retest", 7).trades), 1)  # unaffected
+            engine.storage.close()
+
+
 class AdaptiveTimingOneShotPerMarketTests(unittest.IsolatedAsyncioTestCase):
     """End-to-end: a dynamic_timing strategy scanning a dense checkpoint
     grid must place AT MOST ONE trade per market, even when several of
