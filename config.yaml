@@ -189,35 +189,47 @@ strategies:
     # see). Wire a real news feed in here if you want it to do anything;
     # left empty it's just a numeric strategy with extra latency/cost.
     news_context: ""
-    # Trade only if the model's prob_up is at least this far from a
-    # coin-flip (0.5) — same idea as fair_value_edge's own min_edge, just
-    # applied to the LLM's adjusted probability. Only used by the barrier
-    # ({"prob_up": ...}) response schema below, not the default UP/DOWN one.
+    # Trade only if the model's final prob_up is at least this far from
+    # market_px_up (OKX's own quoted probability) — i.e. only a real
+    # disagreement with the market's own price, not just "> 50%". Same
+    # idea as fair_value_edge's own min_edge, applied to the LLM's
+    # adjusted probability instead of the pure statistical one. Only used
+    # by the barrier ({"prob_up": ...}) response schema below, not the
+    # default UP/DOWN one.
     min_edge: 0.05
+    # Hard cap on how far the model's own "adjustment" field (see
+    # prompt_template below) is allowed to move base_prob, enforced in
+    # code (_signal_from_prob_up), not just requested in the prompt text —
+    # the prompt's own "не более ±$max_adjustment" line is filled in from
+    # this same value, so the two can't drift out of sync.
+    max_adjustment: 0.10
     # Full prompt template — editable here or live from the dashboard's
     # Settings tab (renders as a textarea). Uses $name / ${name} placeholders
     # (Python string.Template, NOT {name}) — deliberately, since a prompt
     # that asks for JSON back contains literal {...}, which str.format
     # would misparse; a typo'd or removed $placeholder is just left as
     # literal text instead of crashing this strategy. All placeholders
-    # (incl. $z_score/$base_prob/$sigma_horizon/$drift_5m/$mom_1m used
-    # below) are documented in src/strategies/ai_prompt.py's module
-    # docstring. This is the barrier-estimate template (statistical
-    # z-score/CDF as an anchor, LLM applies a small bounded correction from
-    # drift/momentum) — swap for DEFAULT_PROMPT_TEMPLATE's plain wording
-    # (also in ai_prompt.py) if you'd rather have a direct UP/DOWN/NONE call.
+    # (incl. $z_score/$base_prob/$sigma_horizon/$drift_5m/$mom_1m/
+    # $max_adjustment used below) are documented in
+    # src/strategies/ai_prompt.py's module docstring. This is the
+    # barrier-estimate template (statistical z-score/CDF as an anchor, LLM
+    # applies a small bounded correction from drift/momentum/orderbook/
+    # funding) — swap for DEFAULT_PROMPT_TEMPLATE's plain wording (also in
+    # ai_prompt.py) if you'd rather have a direct UP/DOWN/NONE call.
     prompt_template: |-
-      $symbol, барьер $target, спот $spot, осталось $seconds_left сек.
+      $symbol, барьер $target, спот $spot, market_px_up=$market_px, осталось $seconds_left сек.
 
       Предрасчитано в коде:
         z-score: $z_score
         нормальная CDF(z): $base_prob
         sigma на оставшийся горизонт: ${sigma_horizon}%
       Дрейф 5 мин: ${drift_5m}% | Импульс 1 мин: ${mom_1m}%
-
+      $orderbook_line$funding_line$context_line
       BASE_PROB — чисто статистическая оценка без учёта направления рынка.
-      Скорректируй её на дрейф и импульс. Коррекция не более ±0.10.
-      Если дрейф и импульс разнонаправлены — коррекция близка к нулю.
+      Скорректируй её на дрейф, импульс, стакан и funding. Коррекция не более ±${max_adjustment}.
+      Если сигналы разнонаправлены — коррекция близка к нулю.
+      Торгуем расхождением между твоей итоговой prob_up и market_px_up, а не отклонением от 0.5 —
+      рынок мог уже частично отразить движение.
 
       {"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,
       "reason":"<=6 слов"}

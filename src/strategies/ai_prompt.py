@@ -37,7 +37,7 @@ from collections import deque
 from string import Template
 from typing import Optional
 
-from ..models import Direction, PricePoint
+from ..models import Direction, EventMarket, PricePoint
 from .base import BaseStrategy, Signal, StrategyContext
 from .fair_value_edge import (
     DEFAULT_MIN_SIGMA_PCT_PER_MIN, DEFAULT_UNFIXED_STRIKE_BASIS_PCT,
@@ -71,7 +71,9 @@ logger = logging.getLogger("okx_event_bot.strategies.ai_prompt")
 #   CDF-probability/vol-scaled-to-horizon behind the fair_value_edge
 #   strategy — "n/a" for all three if there isn't enough price history yet)
 #   $drift_5m $mom_1m (price % change over the last 5min/1min — "n/a" if
-#   not enough history).
+#   not enough history). $max_adjustment (the config.yaml max_adjustment
+#   value, formatted — see BARRIER_PROMPT_TEMPLATE and
+#   _signal_from_prob_up for why this is enforced in code, not just text).
 DEFAULT_PROMPT_TEMPLATE = (
     "BTC event contract, decide UP/DOWN/NONE before expiry.\n"
     "series=$series method=$method strike=$strike remaining=${remaining}s market_px_up=$market_px\n"
@@ -82,21 +84,31 @@ DEFAULT_PROMPT_TEMPLATE = (
 
 # Alternative template: statistical barrier estimate (z-score / normal CDF)
 # as an anchor, with the LLM applying a small BOUNDED correction from
-# short-term drift/momentum — copy into config.yaml's prompt_template (or
-# paste via the dashboard's Settings tab) to use this instead. Expects the
-# {"prob_up": ...} response schema — see _parse_response/_signal_from_prob_up.
+# short-term drift/momentum/orderbook/funding — copy into config.yaml's
+# prompt_template (or paste via the dashboard's Settings tab) to use this
+# instead. Expects the {"base_prob":...,"adjustment":...,"prob_up":...}
+# response schema — see _parse_response/_signal_from_prob_up. The "не более
+# ±$max_adjustment" instruction here is not just wording: _signal_from_prob_up
+# recomputes prob_up itself from base_prob + a server-side-clamped
+# adjustment whenever both fields are present, rather than trusting
+# whatever prob_up number the model echoes back — free text doesn't
+# reliably bind an LLM's own arithmetic, so the bound is enforced in code,
+# not just requested in the prompt.
 BARRIER_PROMPT_TEMPLATE = (
-    "$symbol, барьер $target, спот $spot, осталось $seconds_left сек.\n"
+    "$symbol, барьер $target, спот $spot, market_px_up=$market_px, осталось $seconds_left сек.\n"
     "\n"
     "Предрасчитано в коде:\n"
     "  z-score: $z_score\n"
     "  нормальная CDF(z): $base_prob\n"
     "  sigma на оставшийся горизонт: ${sigma_horizon}%\n"
     "Дрейф 5 мин: ${drift_5m}% | Импульс 1 мин: ${mom_1m}%\n"
+    "$orderbook_line$funding_line$context_line"
     "\n"
     "BASE_PROB — чисто статистическая оценка без учёта направления рынка.\n"
-    "Скорректируй её на дрейф и импульс. Коррекция не более ±0.10.\n"
-    "Если дрейф и импульс разнонаправлены — коррекция близка к нулю.\n"
+    "Скорректируй её на дрейф, импульс, стакан и funding. Коррекция не более ±${max_adjustment}.\n"
+    "Если сигналы разнонаправлены — коррекция близка к нулю.\n"
+    "Торгуем расхождением между твоей итоговой prob_up и market_px_up, а не отклонением от 0.5 —\n"
+    "рынок мог уже частично отразить движение.\n"
     "\n"
     '{"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,\n'
     '"reason":"<=6 слов"}'
@@ -187,6 +199,9 @@ class AIPromptStrategy(BaseStrategy):
                 self._warned_no_key = True
             return None
 
+        if ctx.market.up_price is None:
+            return None  # nothing to show the model or compare its estimate against — save the call
+
         min_gap = float(self.config.get("min_seconds_between_calls", 300))
         now = time.time()
         if now - self._last_call_ts < min_gap:
@@ -226,7 +241,7 @@ class AIPromptStrategy(BaseStrategy):
             self._last_call_ts = now
 
         logger.info("ai_prompt raw response: %s", raw[:500])
-        return self._parse_response(raw)
+        return self._parse_response(raw, ctx.market)
 
     # -- prompt / parsing -----------------------------------------------------------
     # Kept deliberately terse by default — every extra word is input tokens
@@ -260,12 +275,14 @@ class AIPromptStrategy(BaseStrategy):
         )
         drift_5m = _pct_change_over(ctx.price_history, now, 300) if ctx.price_history else None
         mom_1m = _pct_change_over(ctx.price_history, now, 60) if ctx.price_history else None
+        max_adjustment = float(self.config.get("max_adjustment", 0.10))
 
         values = {
             "series": market.series_id, "method": market.method, "strike": market.floor_strike,
             "target": market.floor_strike,
             "remaining": f"{ctx.remaining_sec:.0f}", "seconds_left": f"{ctx.remaining_sec:.0f}",
-            "market_px": market.up_price, "spot": f"{spot:.2f}" if spot is not None else "n/a",
+            "market_px": f"{market.up_price:.3f}" if market.up_price is not None else "n/a",
+            "spot": f"{spot:.2f}" if spot is not None else "n/a",
             "symbol": _guess_symbol(market.series_id),
             "lookback": f"{lookback_sec:.0f}", "price_series": price_series,
             "orderbook_line": (
@@ -280,6 +297,7 @@ class AIPromptStrategy(BaseStrategy):
             "z_score": f"{barrier.z_score:.3f}" if barrier else "n/a",
             "base_prob": f"{barrier.base_prob:.3f}" if barrier else "n/a",
             "sigma_horizon": f"{barrier.sigma_horizon_pct:.3f}" if barrier else "n/a",
+            "max_adjustment": f"{max_adjustment:.2f}",
             "drift_5m": f"{drift_5m:.3f}" if drift_5m is not None else "n/a",
             "mom_1m": f"{mom_1m:.3f}" if mom_1m is not None else "n/a",
         }
@@ -310,7 +328,7 @@ class AIPromptStrategy(BaseStrategy):
                 text = text.rstrip()[:-3]
         return text.strip()
 
-    def _parse_response(self, raw: str) -> Optional[Signal]:
+    def _parse_response(self, raw: str, market: EventMarket) -> Optional[Signal]:
         cleaned = self._strip_markdown_fence(raw)
         try:
             data = json.loads(cleaned)
@@ -322,7 +340,7 @@ class AIPromptStrategy(BaseStrategy):
         #   {"direction": "UP"|"DOWN"|"NONE", "confidence": 0-1, "reason": ...}   (default template)
         #   {"prob_up": 0-1, "reason": ...}   (BARRIER_PROMPT_TEMPLATE and similar)
         if "prob_up" in data:
-            return self._signal_from_prob_up(data)
+            return self._signal_from_prob_up(data, market)
         return self._signal_from_direction(data)
 
     def _signal_from_direction(self, data: dict) -> Optional[Signal]:
@@ -340,25 +358,62 @@ class AIPromptStrategy(BaseStrategy):
         direction = Direction.UP if direction_raw == "UP" else Direction.DOWN
         return Signal(direction=direction, reason=f"AI: {reason}", confidence=confidence)
 
-    def _signal_from_prob_up(self, data: dict) -> Optional[Signal]:
-        """Barrier-style schema: the model returns its adjusted P(UP)
-        directly rather than a discrete direction. Trade only if it's at
-        least `min_edge` away from a coin-flip (0.5) — same idea as the
-        fair_value_edge strategy's own min_edge, just applied to the LLM's
-        adjusted probability instead of the pure statistical one."""
+    def _signal_from_prob_up(self, data: dict, market: EventMarket) -> Optional[Signal]:
+        """Barrier-style schema: the model returns an adjusted P(UP)
+        instead of a discrete direction. Two guardrails enforced HERE,
+        not just requested in the prompt — free text doesn't reliably
+        constrain an LLM's own arithmetic:
+
+        1. The edge that decides whether/which side to trade is
+           `prob_up - market.up_price` — the market's own current price —
+           NOT `prob_up - 0.5`. A probability simply being > 50% means
+           nothing on its own; only a DISAGREEMENT with what the market
+           already prices in is a mispricing worth betting on. (This used
+           to compare against a flat 0.5, which meant it could bet UP on a
+           market already trading at 0.85 as long as the model said
+           anything above 50% — the wrong side of a genuine edge.) Mirrors
+           fair_value_edge's own edge definition exactly.
+
+        2. When the response includes base_prob/adjustment separately
+           (BARRIER_PROMPT_TEMPLATE's schema), the final probability is
+           RECOMPUTED here as base_prob + a server-side-clamped
+           adjustment (±max_adjustment) — rather than trusting whatever
+           prob_up number the model echoed back, which could silently
+           ignore the prompt's own "не более ±X" instruction. Falls back
+           to trusting prob_up verbatim only when base_prob/adjustment
+           aren't both present (e.g. a custom, simpler prompt_template).
+        """
+        max_adjustment = float(self.config.get("max_adjustment", 0.10))
         try:
-            prob_up = float(data.get("prob_up"))
+            base_prob = float(data.get("base_prob"))
+            adjustment = float(data.get("adjustment"))
         except (TypeError, ValueError):
-            logger.warning("ai_prompt: prob_up missing/non-numeric in response: %r", data)
-            return None
-        prob_up = min(max(prob_up, 0.0), 1.0)
+            base_prob = adjustment = None
+
+        if base_prob is not None and adjustment is not None:
+            clamped_adjustment = min(max(adjustment, -max_adjustment), max_adjustment)
+            prob_up = min(max(base_prob + clamped_adjustment, 0.0), 1.0)
+        else:
+            try:
+                prob_up = float(data.get("prob_up"))
+            except (TypeError, ValueError):
+                logger.warning("ai_prompt: prob_up missing/non-numeric in response: %r", data)
+                return None
+            prob_up = min(max(prob_up, 0.0), 1.0)
+
+        if market.up_price is None:
+            return None  # nothing to compare the model's estimate against
 
         min_edge = float(self.config.get("min_edge", 0.05))
-        edge = prob_up - 0.5
+        edge = prob_up - market.up_price
         if abs(edge) < min_edge:
             return None
 
         reason = str(data.get("reason", "AI barrier adjustment"))[:200]
         direction = Direction.UP if edge > 0 else Direction.DOWN
-        confidence = min(abs(edge) * 2, 1.0)  # edge=0 -> 0.0, edge=+-0.5 -> 1.0
-        return Signal(direction=direction, reason=f"AI: {reason} (prob_up={prob_up:.3f})", confidence=confidence)
+        confidence = min(abs(edge) * 2, 1.0)
+        return Signal(
+            direction=direction,
+            reason=f"AI: {reason} (prob_up={prob_up:.3f}, market={market.up_price:.3f}, edge={edge:+.3f})",
+            confidence=confidence,
+        )

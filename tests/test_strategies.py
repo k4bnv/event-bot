@@ -232,34 +232,51 @@ class FakeChatClient:
 
 
 class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
+    # A market with a live up_price — evaluate() now skips the call
+    # entirely (and returns None before ever reaching the LLM) when
+    # market.up_price is None, since there'd be nothing sound to compare
+    # the model's estimate against. Tests exercising what happens AFTER a
+    # call need a live price so they actually reach that code, not just
+    # the new early-exit gate.
+    LIVE_MARKET = staticmethod(lambda: make_market(up_price=0.5))
+
     async def test_valid_up_response_produces_signal(self):
         fake = FakeChatClient(['{"direction": "UP", "confidence": 0.8, "reason": "test"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        signal = await strategy.evaluate(make_ctx([PricePoint(ts=0, price=100)] * 12))
+        ctx = make_ctx([PricePoint(ts=0, price=100)] * 12, market=self.LIVE_MARKET())
+        signal = await strategy.evaluate(ctx)
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, Direction.UP)
         self.assertAlmostEqual(signal.confidence, 0.8)
         self.assertEqual(fake.calls, 1)
 
+    async def test_no_signal_and_no_call_when_market_has_no_live_price(self):
+        # The gate itself: no up_price -> skip before spending an API call.
+        fake = FakeChatClient(['{"direction": "UP", "confidence": 0.8, "reason": "test"}'])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
+        signal = await strategy.evaluate(make_ctx([], market=make_market(up_price=None)))
+        self.assertIsNone(signal)
+        self.assertEqual(fake.calls, 0)
+
     async def test_none_direction_yields_no_signal(self):
         fake = FakeChatClient(['{"direction": "NONE", "confidence": 0.5, "reason": "no edge"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        self.assertIsNone(await strategy.evaluate(make_ctx([])))
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
 
     async def test_malformed_json_degrades_to_no_signal(self):
         fake = FakeChatClient(["not json at all"])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        self.assertIsNone(await strategy.evaluate(make_ctx([])))
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
 
     async def test_api_error_degrades_to_no_signal(self):
         fake = FakeChatClient([ChatAPIError("boom")])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        self.assertIsNone(await strategy.evaluate(make_ctx([])))
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
 
     async def test_confidence_is_clamped_to_0_1(self):
         fake = FakeChatClient(['{"direction": "DOWN", "confidence": 5, "reason": "x"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        signal = await strategy.evaluate(make_ctx([]))
+        signal = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
         self.assertEqual(signal.confidence, 1.0)
 
     async def test_cooldown_skips_second_call(self):
@@ -268,8 +285,8 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
             '{"direction": "UP", "confidence": 0.6, "reason": "b"}',
         ])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 9999}, client=fake)
-        first = await strategy.evaluate(make_ctx([]))
-        second = await strategy.evaluate(make_ctx([]))
+        first = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
+        second = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
         self.assertIsNotNone(first)
         self.assertIsNone(second)   # cooldown -> no signal, and no extra API call
         self.assertEqual(fake.calls, 1)
@@ -282,8 +299,8 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
         strategy = AIPromptStrategy(
             config={"min_seconds_between_calls": 0, "max_calls_per_day": 1}, client=fake,
         )
-        first = await strategy.evaluate(make_ctx([]))
-        second = await strategy.evaluate(make_ctx([]))
+        first = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
+        second = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
         self.assertIsNotNone(first)
         self.assertIsNone(second)          # cap hit -> no signal, no extra API call
         self.assertEqual(fake.calls, 1)    # the cap check runs BEFORE spending anything
@@ -296,7 +313,7 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
     async def test_markdown_fenced_json_is_parsed(self):
         fake = FakeChatClient(['```json\n{"direction": "UP", "confidence": 0.7, "reason": "x"}\n```'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        signal = await strategy.evaluate(make_ctx([]))
+        signal = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, Direction.UP)
 
@@ -328,9 +345,11 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt, "trailing dollar sign: $")
 
     async def test_prob_up_above_threshold_bets_up(self):
+        # market up_price=0.5 makes prob_up-market_px degenerate to the old
+        # prob_up-0.5 comparison for this test's own numbers specifically.
         fake = FakeChatClient(['{"base_prob":0.5,"adjustment":0.08,"prob_up":0.58,"reason":"drift up"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_edge": 0.05}, client=fake)
-        signal = await strategy.evaluate(make_ctx([]))
+        signal = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, Direction.UP)
         self.assertAlmostEqual(signal.confidence, 0.16, places=2)  # |0.58-0.5|*2
@@ -338,19 +357,53 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
     async def test_prob_up_below_half_bets_down(self):
         fake = FakeChatClient(['{"prob_up":0.4,"reason":"drift down"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_edge": 0.05}, client=fake)
-        signal = await strategy.evaluate(make_ctx([]))
+        signal = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, Direction.DOWN)
 
     async def test_prob_up_within_band_of_half_no_signal(self):
         fake = FakeChatClient(['{"prob_up":0.52,"reason":"barely off coinflip"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_edge": 0.05}, client=fake)
-        self.assertIsNone(await strategy.evaluate(make_ctx([])))
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
 
     async def test_prob_up_missing_or_non_numeric_no_signal(self):
         fake = FakeChatClient(['{"prob_up":"not-a-number","reason":"x"}'])
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
-        self.assertIsNone(await strategy.evaluate(make_ctx([])))
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
+
+    async def test_edge_is_measured_against_market_price_not_a_flat_half(self):
+        # The actual bug this fixes: a naive prob_up-0.5 comparison would
+        # bet UP here (0.60 > 0.5) even though the market is ALREADY at
+        # 0.85 — i.e. the model thinks UP is LESS likely than the market
+        # does. That's a real disagreement favoring DOWN, not UP.
+        fake = FakeChatClient(['{"prob_up":0.60,"reason":"model still bullish but less than market"}'])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_edge": 0.05}, client=fake)
+        market = make_market(up_price=0.85, floor_strike=100.0)
+        signal = await strategy.evaluate(make_ctx([], market=market))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)  # not UP, despite prob_up > 0.5
+
+    async def test_no_signal_when_prob_up_matches_market_price(self):
+        # Model's estimate agrees with the market almost exactly -> no
+        # edge, regardless of how far prob_up itself sits from 0.5.
+        fake = FakeChatClient(['{"prob_up":0.83,"reason":"agrees with market"}'])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_edge": 0.05}, client=fake)
+        market = make_market(up_price=0.85, floor_strike=100.0)
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=market)))
+
+    async def test_adjustment_beyond_max_is_clamped_server_side(self):
+        # The model ignores "не более ±0.10" and returns a 0.30 adjustment
+        # anyway — the final prob_up must reflect the CLAMPED adjustment
+        # (0.5+0.10=0.60), not the model's own unclamped arithmetic (0.80),
+        # regardless of what prob_up field the model itself echoed back.
+        fake = FakeChatClient(['{"base_prob":0.5,"adjustment":0.30,"prob_up":0.80,"reason":"overconfident"}'])
+        strategy = AIPromptStrategy(
+            config={"min_seconds_between_calls": 0, "min_edge": 0.05, "max_adjustment": 0.10}, client=fake,
+        )
+        market = make_market(up_price=0.5, floor_strike=100.0)
+        signal = await strategy.evaluate(make_ctx([], market=market))
+        self.assertIsNotNone(signal)
+        self.assertIn("prob_up=0.600", signal.reason)  # clamped to 0.5+0.10, not the model's 0.80
 
 
 class BarrierPromptTemplateTests(unittest.IsolatedAsyncioTestCase):
