@@ -596,100 +596,137 @@ async def check_leadlag(
         timeout_sec=cfg.okx.request_timeout_sec, max_retries=cfg.okx.max_retries,
     )
 
+    data_dir = Path(cfg.storage.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    samples_path = data_dir / f"leadlag_samples_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+
     print(
         f"Collecting {duration_sec:.0f}s of Binance vs OKX spot BTC-USDT ({cfg.okx.underlying_inst_id}), "
         f"polling every {poll_interval_sec:.1f}s — no API keys needed, both are public tickers.\n"
+        f"Raw samples are written incrementally to {samples_path} as they come in — if this "
+        f"session gets disconnected partway through (e.g. a dropped SSH/console), that file "
+        f"still has everything collected up to the disconnect; run without `nohup` at your "
+        f"own risk on a flaky connection.\n"
     )
 
     binance_series: list[tuple[float, float]] = []
     okx_series: list[tuple[float, float]] = []
 
-    async with OKXClient(client_cfg) as okx_client, aiohttp.ClientSession() as binance_session:
-        end_at = time.time() + duration_sec
-        n = 0
-        while time.time() < end_at:
-            tick_start = time.time()
-            binance_price, okx_price = await asyncio.gather(
-                _fetch_binance_price(binance_session), _fetch_okx_spot_price(okx_client, cfg.okx.underlying_inst_id),
-            )
-            now = time.time()
-            if binance_price is not None:
-                binance_series.append((now, binance_price))
-            if okx_price is not None:
-                okx_series.append((now, okx_price))
-            n += 1
-            if n % 30 == 0:
-                remaining = max(0.0, end_at - time.time())
-                print(f"  ...{n} samples so far, ~{remaining:.0f}s left")
-            elapsed = time.time() - tick_start
-            await asyncio.sleep(max(0.0, poll_interval_sec - elapsed))
+    # Opened before the loop and flushed after every row — this is what
+    # makes the run survive a dropped connection killing the process
+    # mid-collection: whatever was written before the drop is safe on
+    # disk, readable from the host too (data/ is a mounted volume).
+    with open(samples_path, "w", newline="") as samples_file:
+        samples_writer = csv.DictWriter(samples_file, fieldnames=["ts", "binance_price", "okx_price"])
+        samples_writer.writeheader()
 
-    print(f"\nCollected {len(binance_series)} Binance samples, {len(okx_series)} OKX samples.")
+        async with OKXClient(client_cfg) as okx_client, aiohttp.ClientSession() as binance_session:
+            end_at = time.time() + duration_sec
+            n = 0
+            while time.time() < end_at:
+                tick_start = time.time()
+                binance_price, okx_price = await asyncio.gather(
+                    _fetch_binance_price(binance_session),
+                    _fetch_okx_spot_price(okx_client, cfg.okx.underlying_inst_id),
+                )
+                now = time.time()
+                if binance_price is not None:
+                    binance_series.append((now, binance_price))
+                if okx_price is not None:
+                    okx_series.append((now, okx_price))
+                samples_writer.writerow({"ts": now, "binance_price": binance_price, "okx_price": okx_price})
+                samples_file.flush()
+                n += 1
+                if n % 30 == 0:
+                    remaining = max(0.0, end_at - time.time())
+                    print(f"  ...{n} samples so far, ~{remaining:.0f}s left (saved to {samples_path.name})")
+                elapsed = time.time() - tick_start
+                await asyncio.sleep(max(0.0, poll_interval_sec - elapsed))
+
+    print(f"\nCollected {len(binance_series)} Binance samples, {len(okx_series)} OKX samples "
+          f"(raw data in {samples_path}).")
     if len(binance_series) < 10 or len(okx_series) < 10:
         print("Not enough data to analyze (too many failed requests?) — check network/API access and retry.")
         return
 
-    impulses = _detect_impulses(binance_series, impulse_threshold_pct, window_sec, cooldown_sec=window_sec)
-    print(
-        f"\nDetected {len(impulses)} impulses on Binance "
-        f"(>= {impulse_threshold_pct:.3f}% move within {window_sec:.0f}s, "
-        f"{window_sec:.0f}s cooldown between detections):"
-    )
-    for imp in impulses:
-        t = time.strftime("%H:%M:%S", time.localtime(imp["end_ts"]))
-        print(f"  {t}  {imp['direction'].upper():5s}  move={imp['move_pct']:+.3f}%")
+    # Every line from here on is both printed live AND accumulated, then
+    # written to a report file in `finally` — regardless of which return
+    # point below is hit (no impulses / no reaction / full result), so a
+    # dropped connection right at the end still leaves the conclusion on
+    # disk, not just whatever scrolled past on a terminal that's now gone.
+    report_lines: list[str] = []
 
-    if not impulses:
-        print(
-            "\nNo impulses detected in this window — try a longer --duration-sec, run during a more "
-            "volatile period, or lower --impulse-threshold-pct. Can't measure a lag with no events to "
-            "measure it from."
-        )
-        return
+    def out(line: str = "") -> None:
+        print(line)
+        report_lines.append(line)
 
-    lags = _measure_reaction_lag(impulses, okx_series, lag_horizon_sec, react_threshold_pct)
-    print(
-        f"\nOKX spot reaction (>= {react_threshold_pct:.3f}% same-direction move within "
-        f"{lag_horizon_sec:.0f}s of the Binance impulse):"
-    )
-    for imp, lag in zip(impulses, lags):
-        lag_str = f"{lag:.1f}s later" if lag is not None else f"no reaction within {lag_horizon_sec:.0f}s"
-        print(f"  Binance {imp['direction'].upper():5s} {imp['move_pct']:+.3f}%  ->  OKX: {lag_str}")
+    report_path = data_dir / f"leadlag_report_{time.strftime('%Y%m%d_%H%M%S')}.txt"
+    try:
+        impulses = _detect_impulses(binance_series, impulse_threshold_pct, window_sec, cooldown_sec=window_sec)
+        out(
+            f"\nDetected {len(impulses)} impulses on Binance "
+            f"(>= {impulse_threshold_pct:.3f}% move within {window_sec:.0f}s, "
+            f"{window_sec:.0f}s cooldown between detections):"
+        )
+        for imp in impulses:
+            t = time.strftime("%H:%M:%S", time.localtime(imp["end_ts"]))
+            out(f"  {t}  {imp['direction'].upper():5s}  move={imp['move_pct']:+.3f}%")
 
-    reacted = sorted(l for l in lags if l is not None)
-    print(f"\n{'=' * 64}\nSummary\n{'=' * 64}")
-    if not reacted:
-        print(
-            f"0/{len(impulses)} impulses got any OKX reaction within {lag_horizon_sec:.0f}s — either OKX "
-            f"didn't move at all, or it reacted too fast/too small to separate from noise at this "
-            f"threshold. Inconclusive either way — try a lower --react-threshold-pct or a longer "
-            f"--lag-horizon-sec before concluding there's nothing here."
-        )
-        return
+        if not impulses:
+            out(
+                "\nNo impulses detected in this window — try a longer --duration-sec, run during a more "
+                "volatile period, or lower --impulse-threshold-pct. Can't measure a lag with no events to "
+                "measure it from."
+            )
+            return
 
-    median = reacted[len(reacted) // 2]
-    print(
-        f"{len(reacted)}/{len(impulses)} impulses got an OKX reaction within {lag_horizon_sec:.0f}s.\n"
-        f"lag (seconds):  min={min(reacted):.1f}  median={median:.1f}  "
-        f"mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
-    )
-    if median < poll_interval_sec * 1.5:
-        print(
-            "\n-> OKX reacts about as fast as our own polling resolution can even distinguish — no "
-            "usable lag visible at this measurement granularity. Consistent with OKX spot being just "
-            "as fast/liquid as Binance (expected for a top-tier BTC/USDT pair — real arbitrageurs keep "
-            "them in sync to milliseconds, well below what REST polling can see)."
+        lags = _measure_reaction_lag(impulses, okx_series, lag_horizon_sec, react_threshold_pct)
+        out(
+            f"\nOKX spot reaction (>= {react_threshold_pct:.3f}% same-direction move within "
+            f"{lag_horizon_sec:.0f}s of the Binance impulse):"
         )
-    else:
-        print(
-            f"\n-> OKX spot appears to lag Binance by ~{median:.1f}s on average — POTENTIALLY real. "
-            f"Caveats before building anything on this: (1) this measured raw SPOT price only, NOT the "
-            f"event contract's own up_price (a separate, nonlinear quantity — measure that specifically "
-            f"next); (2) a handful of impulses isn't a lot of samples — rerun with a longer "
-            f"--duration-sec / during more volatile periods to see if this holds up; (3) even a real "
-            f"few-second lag may not survive execution latency + the slippage we already measured with "
-            f"--check-liquidity."
+        for imp, lag in zip(impulses, lags):
+            lag_str = f"{lag:.1f}s later" if lag is not None else f"no reaction within {lag_horizon_sec:.0f}s"
+            out(f"  Binance {imp['direction'].upper():5s} {imp['move_pct']:+.3f}%  ->  OKX: {lag_str}")
+
+        reacted = sorted(l for l in lags if l is not None)
+        out(f"\n{'=' * 64}\nSummary\n{'=' * 64}")
+        if not reacted:
+            out(
+                f"0/{len(impulses)} impulses got any OKX reaction within {lag_horizon_sec:.0f}s — either OKX "
+                f"didn't move at all, or it reacted too fast/too small to separate from noise at this "
+                f"threshold. Inconclusive either way — try a lower --react-threshold-pct or a longer "
+                f"--lag-horizon-sec before concluding there's nothing here."
+            )
+            return
+
+        median = reacted[len(reacted) // 2]
+        out(
+            f"{len(reacted)}/{len(impulses)} impulses got an OKX reaction within {lag_horizon_sec:.0f}s.\n"
+            f"lag (seconds):  min={min(reacted):.1f}  median={median:.1f}  "
+            f"mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
         )
+        if median < poll_interval_sec * 1.5:
+            out(
+                "\n-> OKX reacts about as fast as our own polling resolution can even distinguish — no "
+                "usable lag visible at this measurement granularity. Consistent with OKX spot being just "
+                "as fast/liquid as Binance (expected for a top-tier BTC/USDT pair — real arbitrageurs keep "
+                "them in sync to milliseconds, well below what REST polling can see)."
+            )
+        else:
+            out(
+                f"\n-> OKX spot appears to lag Binance by ~{median:.1f}s on average — POTENTIALLY real. "
+                f"Caveats before building anything on this: (1) this measured raw SPOT price only, NOT the "
+                f"event contract's own up_price (a separate, nonlinear quantity — measure that specifically "
+                f"next); (2) a handful of impulses isn't a lot of samples — rerun with a longer "
+                f"--duration-sec / during more volatile periods to see if this holds up; (3) even a real "
+                f"few-second lag may not survive execution latency + the slippage we already measured with "
+                f"--check-liquidity."
+            )
+    finally:
+        if report_lines:
+            report_path.write_text("\n".join(report_lines) + "\n", encoding="utf-8")
+            print(f"\n(report saved to {report_path})")
 
 
 async def run_bot(cfg) -> None:
