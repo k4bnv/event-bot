@@ -32,6 +32,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import AppConfig
 from .engine import Engine
+from .models import TradeStatus
 from .storage import TRADE_FIELDS
 
 AUTH_COOKIE_NAME = "okx_bot_session"
@@ -272,7 +273,6 @@ INDEX_HTML = """<!doctype html>
 
   <div id="dashboardView">
     <div class="card"><h3>Виртуальные кошельки</h3><table id="wallets"></table></div>
-    <div class="card"><h3>Стратегия × время входа</h3><table id="combos"></table></div>
     <div class="card"><h3>Активные сделки</h3><table id="open"></table></div>
     <div class="card leader" id="leaderboard"></div>
   </div>
@@ -704,22 +704,14 @@ async function tick(){
   document.getElementById('meta').textContent =
     `BTC/USDT: ${d.underlying_price ?? '—'}   updated ${new Date(d.updated_at*1000).toLocaleTimeString()}`;
 
-  let w = '<tr><th>Стратегия</th><th>Депозит</th><th>Баланс</th><th>В сделках</th><th>Equity</th><th>PnL</th><th>Открыто</th></tr>';
+  let w = '<tr><th>Стратегия</th><th>Баланс</th><th>В сделках</th><th>Equity</th><th>PnL</th><th>W/L</th><th>Winrate</th><th>Открыто</th></tr>';
   for (const x of d.wallets) {
-    w += `<tr><td>${x.display_name}</td><td>$${x.initial_balance.toFixed(2)}</td><td>$${x.balance.toFixed(2)}</td>
+    w += `<tr><td>${x.display_name}</td><td>$${x.balance.toFixed(2)}</td>
           <td>$${x.reserved.toFixed(2)}</td><td>$${x.equity.toFixed(2)}</td>
-          <td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td><td>${x.open_trades}</td></tr>`;
+          <td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td>
+          <td>${x.wins}W/${x.losses}L</td><td>${x.winrate_pct.toFixed(1)}%</td><td>${x.open_trades}</td></tr>`;
   }
   document.getElementById('wallets').innerHTML = w;
-
-  let c = '<tr><th>Стратегия</th><th>Окно</th><th>Сделок</th><th>Winrate</th><th>Ср.коэфф</th><th>PnL</th><th>ROI</th></tr>';
-  for (const x of d.combos) {
-    c += `<tr><td>${x.display_name}</td><td>${x.window_min} мин</td><td>${x.trades} (${x.wins}W/${x.losses}L)</td>
-          <td>${x.winrate_pct.toFixed(1)}%</td><td>$${x.avg_entry_price.toFixed(3)}</td>
-          <td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td>
-          <td class="${cls(x.roi_pct)}">${x.roi_pct.toFixed(1)}%</td></tr>`;
-  }
-  document.getElementById('combos').innerHTML = c || '';
 
   let o = '<tr><th>Стратегия</th><th>Инструмент</th><th>Напр.</th><th>Вход</th><th>Стейк</th><th>Осталось</th></tr>';
   for (const x of d.open_trades) {
@@ -913,8 +905,12 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
         # None for a dynamic_timing strategy's one shared wallet (see
         # StrategyConfig.dynamic_timing) — labeled "(авто)" rather than
         # "(Noneм)".
-        wallets = [
-            {
+        def _wallet_record(w):
+            closed = w.closed_trades()
+            wins = sum(1 for t in closed if t.status == TradeStatus.WON)
+            losses = len(closed) - wins
+            winrate_pct = (wins / len(closed) * 100) if closed else 0.0
+            return {
                 "strategy": w.strategy,
                 "window_min": w.window_min,
                 "display_name": (
@@ -926,9 +922,15 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
                 "reserved": w.reserved,
                 "equity": w.equity,
                 "net_pnl": w.net_pnl,
+                "wins": wins,
+                "losses": losses,
+                "winrate_pct": winrate_pct,
                 "open_trades": len(w.open_trades()),
                 "equity_curve": _equity_curve(w),
             }
+
+        wallets = [
+            _wallet_record(w)
             for w in sorted(snap.wallets.values(), key=lambda w: (w.strategy, -(w.window_min or 0)))
         ]
 
