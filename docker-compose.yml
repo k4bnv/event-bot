@@ -13,4 +13,16 @@ services:
       # seriesId / tune strategies without rebuilding.
       - ./config.yaml:/app/config.yaml:ro
       # Persists bot.db (SQLite) and bot.log across restarts/rebuilds.
-      - ./data:/app/data
+      #
+      # Defaults to ./data (next to this compose file) — fine as long as
+      # your redeploy re-runs `docker compose up --build` IN THE SAME
+      # checkout directory. If your deploy instead does a fresh `git
+      # clone`/checkout into a new directory each time (common on many
+      # PaaS/CI setups), ./data there is empty (data/ is gitignored on
+      # purpose) and history is silently lost on every redeploy.
+      #
+      # Fix: set BOT_DATA_DIR in .env to an ABSOLUTE path OUTSIDE any git
+      # checkout, e.g. BOT_DATA_DIR=/var/lib/okx-event-bot-data — same
+      # host path every deploy, survives a repo being re-cloned/rebuilt
+      # from scratch. Leave unset to keep the ./data default.
+      - ${BOT_DATA_DIR:-./data}:/app/data
