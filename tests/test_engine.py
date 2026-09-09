@@ -201,6 +201,7 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
                 expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.05, state="live", book=book,
             )
             engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
 
             # Force a deterministic UP signal from ONE strategy, skip the rest.
             strategy = engine.strategy_instances["breakout_retest"]
@@ -210,15 +211,15 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()
 
-            # Multiple configured checkpoints (12/7/2) can all be "due" at
-            # once this close to expiry — assert on every trade opened
-            # rather than assuming exactly one.
+            # Exactly the "2" checkpoint is reachable/due here (see
+            # _prime_entry_window) -> exactly one trade, not "however many
+            # of [12, 7, 2] happen to be due at once".
             trades = engine.wallets["breakout_retest"].trades
-            self.assertGreater(len(trades), 0)
-            for trade in trades:
-                self.assertGreater(trade.entry_price, 0.05)  # NOT the naive quoted price
-                self.assertNotEqual(trade.entry_price, market.up_price)
-                self.assertEqual(trade.contracts, trade.stake_usd / trade.entry_price)
+            self.assertEqual(len(trades), 1)
+            trade = trades[0]
+            self.assertGreater(trade.entry_price, 0.05)  # NOT the naive quoted price
+            self.assertNotEqual(trade.entry_price, market.up_price)
+            self.assertEqual(trade.contracts, trade.stake_usd / trade.entry_price)
             self.assertEqual(engine.wallets["mean_reversion"].trades, [])  # stubbed to no-signal
             engine.storage.close()
 
@@ -242,6 +243,7 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
                 expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.05, state="live", book=book,
             )
             engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
 
             strategy = engine.strategy_instances["breakout_retest"]
             strategy.evaluate = lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
@@ -271,6 +273,7 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
                 expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.05, state="live", book=book,
             )
             engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
 
             strategy = engine.strategy_instances["breakout_retest"]
             strategy.evaluate = lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
@@ -279,12 +282,28 @@ class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
 
             await engine._open_due_trades()
 
-            self.assertGreater(len(engine.wallets["breakout_retest"].trades), 0)
+            self.assertEqual(len(engine.wallets["breakout_retest"].trades), 1)
             engine.storage.close()
 
 
 async def _async_result(value):
     return value
+
+
+def _prime_entry_window(engine: Engine, series_id: str, expiry_ts: float, strategy_name: str) -> None:
+    """Establish this (series, expiry, strategy) window's "start" remaining
+    time in EntryWindowManager BEFORE calling _open_due_trades() with a
+    market that's already close to expiry — otherwise the very first
+    observation IS the close-to-expiry one, and EntryWindowManager
+    correctly refuses to fire any configured checkpoint the window could
+    never have genuinely crossed from above (see timing.py's docstring).
+    A real engine naturally "primes" every window this way just by
+    polling it starting minutes earlier; these tests jump straight to
+    a near-expiry snapshot; this line stands in for that earlier polling
+    so exactly the checkpoints the test intends to be reachable are.
+    """
+    s_cfg = next(s for s in engine.cfg.strategies if s.name == strategy_name)
+    engine.timing.due_windows(series_id, expiry_ts, strategy_name, 300.0, s_cfg.entry_windows_min)
 
 
 class SettleExpiredTradesThrottleTests(unittest.IsolatedAsyncioTestCase):
@@ -403,11 +422,16 @@ class ActivityFeedTests(unittest.IsolatedAsyncioTestCase):
             engine = self._make_engine(Path(tmp))
             series_id = engine.cfg.okx.series_ids[0]
 
+            expiry_ts = time.time() + 60
             market = EventMarket(
                 series_id=series_id, method="price_up_down", inst_id="TEST-INST",
-                expiry_ts=time.time() + 60, floor_strike=50000.0, up_price=0.4, state="live",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.4, state="live",
             )
             engine.provider._active_markets[series_id] = market
+            # Both strategies get evaluated in this test -> both need their
+            # own window primed (EntryWindowManager keys on strategy name too).
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
+            _prime_entry_window(engine, series_id, expiry_ts, "mean_reversion")
             engine.strategy_instances["breakout_retest"].evaluate = (
                 lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
             )
@@ -433,11 +457,13 @@ class ActivityFeedTests(unittest.IsolatedAsyncioTestCase):
             s_cfg = next(s for s in engine.cfg.strategies if s.name == "breakout_retest")
 
             # naive/fill price (0.9) sits above this strategy's max_coefficient (0.55)
+            expiry_ts = time.time() + 60
             market = EventMarket(
                 series_id=series_id, method="price_up_down", inst_id="TEST-INST",
-                expiry_ts=time.time() + 60, floor_strike=50000.0, up_price=0.9, state="live",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.9, state="live",
             )
             engine.provider._active_markets[series_id] = market
+            _prime_entry_window(engine, series_id, expiry_ts, "breakout_retest")
             engine.strategy_instances["breakout_retest"].evaluate = (
                 lambda ctx: _async_result(Signal(direction=Direction.UP, reason="test"))
             )
