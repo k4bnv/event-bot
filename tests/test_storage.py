@@ -1,8 +1,10 @@
+import datetime as dt
 import sys
 import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -309,6 +311,158 @@ class CheckpointFeaturesTests(unittest.TestCase):
             storage.reset_strategy("a")
 
             self.assertEqual(storage.count_checkpoint_features(strategy="a"), 1)
+            storage.close()
+
+
+def make_closed_trade_with_features(
+    storage: Storage, strategy: str = "a", won: bool = True, stake: float = 10.0,
+    opened_ts: Optional[float] = None, link_features: bool = True, **feature_overrides,
+) -> Trade:
+    """A trade that's both in the trades table (closed, won/lost) AND has
+    a linked checkpoint_features row (trade_id set) carrying whatever
+    market-context fields the caller passes as feature_overrides (e.g.
+    sigma_horizon_pct=0.5, drift_5m_pct=-0.2) — the exact shape
+    get_volatility_regime_stats/get_trend_direction_stats join against.
+    `link_features=False` closes the trade WITHOUT a checkpoint_features
+    row at all, for the "trades that never opened via a logged checkpoint
+    don't count" case."""
+    wallet = VirtualWallet(strategy=strategy, initial_balance=1000.0)
+    t = make_settled_trade(strategy)
+    t.stake_usd = stake
+    t.contracts = stake / t.entry_price
+    if opened_ts is not None:
+        t.opened_ts = opened_ts
+    wallet.open_trade(t)
+    wallet.settle_trade(t, won=won)
+    t.closed_ts = t.opened_ts + 60.0
+    storage.append_closed_trades({strategy: wallet})
+    if link_features:
+        storage.log_checkpoint_features(make_feature_row(
+            id_=f"f-{t.id}", strategy=strategy, decision="opened", trade_id=t.id, **feature_overrides,
+        ))
+    return t
+
+
+def utc_hour_ts(hour: int) -> float:
+    """An arbitrary but fixed timestamp landing at exactly `hour` UTC —
+    lets a test target a specific bucket of get_hourly_stats without
+    depending on when the test happens to run."""
+    return dt.datetime(2024, 1, 1, hour, 30, 0, tzinfo=dt.timezone.utc).timestamp()
+
+
+class PatternBreakdownTests(unittest.TestCase):
+    """Covers the Analytics tab's "Закономерности" (hour-of-day /
+    volatility regime / trend direction) breakdowns — see
+    Storage.get_hourly_stats/get_volatility_regime_stats/
+    get_trend_direction_stats."""
+
+    def test_get_hourly_stats_buckets_by_utc_hour_of_open_and_always_has_24_rows(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            make_closed_trade_with_features(storage, won=True, opened_ts=utc_hour_ts(5), link_features=False)
+            make_closed_trade_with_features(storage, won=False, opened_ts=utc_hour_ts(5), link_features=False)
+            make_closed_trade_with_features(storage, won=True, opened_ts=utc_hour_ts(17), link_features=False)
+
+            rows = storage.get_hourly_stats()
+            self.assertEqual(len(rows), 24)  # every hour present, not just the ones with data
+            by_label = {r["label"]: r for r in rows}
+
+            self.assertEqual(by_label["05:00"]["trades"], 2)
+            self.assertEqual(by_label["05:00"]["wins"], 1)
+            self.assertEqual(by_label["05:00"]["losses"], 1)
+            self.assertEqual(by_label["05:00"]["winrate_pct"], 50.0)
+
+            self.assertEqual(by_label["17:00"]["trades"], 1)
+            self.assertEqual(by_label["17:00"]["wins"], 1)
+
+            # An hour with no trades at all is zero-filled, not missing.
+            self.assertEqual(by_label["03:00"]["trades"], 0)
+            self.assertEqual(by_label["03:00"]["winrate_pct"], 0.0)
+            self.assertEqual(by_label["03:00"]["net_pnl"], 0.0)
+            storage.close()
+
+    def test_get_hourly_stats_filters_by_strategy(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            make_closed_trade_with_features(storage, strategy="a", opened_ts=utc_hour_ts(9), link_features=False)
+            make_closed_trade_with_features(storage, strategy="b", opened_ts=utc_hour_ts(9), link_features=False)
+
+            rows = storage.get_hourly_stats(strategy="a")
+            by_label = {r["label"]: r for r in rows}
+            self.assertEqual(by_label["09:00"]["trades"], 1)
+            storage.close()
+
+    def test_get_volatility_regime_stats_splits_into_terciles_low_to_high(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            # Six trades, sigma strictly increasing — NTILE(3) over 6 rows
+            # gives exactly 2 per bucket. Make the low-sigma pair lose and
+            # the high-sigma pair win, so the buckets' PnL sign confirms
+            # they were split in the right ORDER, not just into 3 groups.
+            for sigma in (0.1, 0.2):
+                make_closed_trade_with_features(storage, won=False, sigma_horizon_pct=sigma)
+            for sigma in (0.3, 0.4):
+                make_closed_trade_with_features(storage, won=True, sigma_horizon_pct=sigma)
+            for sigma in (0.5, 0.6):
+                make_closed_trade_with_features(storage, won=True, sigma_horizon_pct=sigma)
+
+            rows = storage.get_volatility_regime_stats()
+            self.assertEqual([r["label"] for r in rows], ["Низкая", "Средняя", "Высокая"])
+            by_label = {r["label"]: r for r in rows}
+            self.assertEqual(by_label["Низкая"]["trades"], 2)
+            self.assertEqual(by_label["Низкая"]["wins"], 0)
+            self.assertEqual(by_label["Средняя"]["wins"], 2)
+            self.assertEqual(by_label["Высокая"]["wins"], 2)
+            storage.close()
+
+    def test_get_volatility_regime_stats_ignores_trades_without_a_feature_row(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            make_closed_trade_with_features(storage, won=True, link_features=False)  # no trade_id link at all
+
+            rows = storage.get_volatility_regime_stats()
+            self.assertEqual(sum(r["trades"] for r in rows), 0)  # nothing to bucket
+            storage.close()
+
+    def test_get_volatility_regime_stats_zero_fills_when_too_little_data(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            make_closed_trade_with_features(storage, won=True, sigma_horizon_pct=0.3)
+
+            rows = storage.get_volatility_regime_stats()
+            # Always exactly 3 rows even with just 1 trade — NTILE can't
+            # populate all three buckets yet, the empty ones are 0, not absent.
+            self.assertEqual([r["label"] for r in rows], ["Низкая", "Средняя", "Высокая"])
+            self.assertEqual(sum(r["trades"] for r in rows), 1)
+            storage.close()
+
+    def test_get_trend_direction_stats_splits_up_flat_down(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            make_closed_trade_with_features(storage, won=True, drift_5m_pct=0.5)     # clearly up
+            make_closed_trade_with_features(storage, won=False, drift_5m_pct=-0.5)  # clearly down
+            make_closed_trade_with_features(storage, won=True, drift_5m_pct=0.001)   # inside the deadband -> flat
+
+            rows = storage.get_trend_direction_stats()
+            self.assertEqual([r["label"] for r in rows], ["Рост", "Флэт", "Падение"])
+            by_label = {r["label"]: r for r in rows}
+            self.assertEqual(by_label["Рост"]["trades"], 1)
+            self.assertEqual(by_label["Рост"]["wins"], 1)
+            self.assertEqual(by_label["Флэт"]["trades"], 1)
+            self.assertEqual(by_label["Падение"]["trades"], 1)
+            self.assertEqual(by_label["Падение"]["wins"], 0)
+            storage.close()
+
+    def test_get_trend_direction_stats_zero_fills_a_bucket_with_no_trades(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            make_closed_trade_with_features(storage, won=True, drift_5m_pct=0.5)  # only "up", ever
+
+            rows = storage.get_trend_direction_stats()
+            by_label = {r["label"]: r for r in rows}
+            self.assertEqual(by_label["Рост"]["trades"], 1)
+            self.assertEqual(by_label["Флэт"]["trades"], 0)   # zero-filled, not missing
+            self.assertEqual(by_label["Падение"]["trades"], 0)
             storage.close()
 
 

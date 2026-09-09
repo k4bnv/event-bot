@@ -281,6 +281,9 @@ INDEX_HTML = """<!doctype html>
     <div class="card chart-card"><h3>Кривая эквити по стратегиям</h3><div id="equityChart"></div></div>
     <div class="card chart-card"><h3>PnL по стратегиям, $</h3><div id="pnlChart"></div></div>
     <div class="card chart-card"><h3>Winrate по связкам «стратегия × окно», %</h3><div id="winrateChart"></div></div>
+    <div class="card"><h3>По часу входа (UTC)</h3><table id="byHour"></table></div>
+    <div class="card"><h3>По волатильности рынка при входе</h3><table id="byVolatility"></table></div>
+    <div class="card"><h3>По направлению тренда при входе</h3><table id="byTrend"></table></div>
     <div class="card">
       <h3>История сделок</h3>
       <div class="analytics-controls">
@@ -363,6 +366,7 @@ function showTab(tab){
   if (tab === 'analytics') {
     if (!tradesFilterLoaded) loadTradesFilterOptions();
     loadTradesTable();
+    loadPatterns();
   }
   if (tab === 'logs') {
     if (!logsFilterLoaded) loadLogsFilterOptions();
@@ -527,6 +531,23 @@ async function loadTradesTable(){
     : 'Нет закрытых сделок по этому фильтру';
 
   renderTradesPager(d.total);
+}
+
+function patternsTableHtml(headLabel, rows){
+  let html = `<tr><th>${headLabel}</th><th>Сделок</th><th>W/L</th><th>Winrate</th><th>PnL</th></tr>`;
+  for (const x of rows) {
+    html += `<tr><td>${x.label}</td><td>${x.trades}</td><td>${x.wins}W/${x.losses}L</td>
+          <td>${x.winrate_pct.toFixed(1)}%</td><td class="${cls(x.net_pnl)}">${money(x.net_pnl)}</td></tr>`;
+  }
+  return html;
+}
+
+async function loadPatterns(){
+  const r = await fetch('/api/patterns');
+  const d = await r.json();
+  document.getElementById('byHour').innerHTML = patternsTableHtml('Час', d.by_hour);
+  document.getElementById('byVolatility').innerHTML = patternsTableHtml('Режим', d.by_volatility);
+  document.getElementById('byTrend').innerHTML = patternsTableHtml('Тренд', d.by_trend);
 }
 
 // -- tiny inline-SVG charts (no charting library) ----------------------------------
@@ -1006,6 +1027,23 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
                 "rows": rows,
                 "total": engine.storage.count_trades(strategy=strategy),
                 "stats": engine.storage.trades_stats(strategy=strategy),
+            }
+        )
+
+    @app.get("/api/patterns")
+    async def get_patterns(strategy: Optional[str] = None) -> JSONResponse:
+        """Bot-wide (or, with `strategy`, one strategy's) win/loss/PnL
+        broken down by hour-of-day, realized-volatility regime, and BTC
+        trend direction at entry — the Analytics tab's "Закономерности"
+        cards. Reads the durable trades/checkpoint_features tables
+        directly (see Storage.get_hourly_stats/get_volatility_regime_stats
+        /get_trend_direction_stats), so these cover the bot's FULL
+        history, not just what's still in memory since the last restart."""
+        return JSONResponse(
+            {
+                "by_hour": engine.storage.get_hourly_stats(strategy=strategy),
+                "by_volatility": engine.storage.get_volatility_regime_stats(strategy=strategy),
+                "by_trend": engine.storage.get_trend_direction_stats(strategy=strategy),
             }
         )
 

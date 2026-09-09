@@ -139,6 +139,11 @@ FEATURE_SORTABLE_COLUMNS = {
     "ts", "strategy", "series_id", "window_min", "remaining_sec", "decision", "trade_id",
 }
 
+# See get_trend_direction_stats — a starting heuristic, not a tuned
+# constant. Below this magnitude, drift_5m_pct counts as "Флэт" rather
+# than a real up/down trend.
+TREND_DEADBAND_PCT = 0.03
+
 
 class Storage:
     def __init__(self, data_dir: Path):
@@ -387,3 +392,114 @@ class Storage:
             "winrate_pct": (wins / total * 100) if total else 0.0,
             "net_pnl": net_pnl,
         }
+
+    @staticmethod
+    def _bucket_rows(cur, ordered_labels: dict) -> list[dict]:
+        """Shared shape for every "win/loss/PnL grouped by some bucket"
+        query below: `cur` must have already run a query whose SELECT is
+        exactly (bucket_key, COUNT(*), wins, losses, net_pnl).
+        `ordered_labels` (e.g. {1: "Низкая", 2: "Средняя", 3: "Высокая"})
+        both renames each raw SQL bucket value into the label the
+        dashboard shows AND fixes the output's shape: every key in it
+        gets exactly one row, zero-filled if that bucket had no matching
+        trades — a bucket that's empty right now (e.g. too few trades so
+        far for NTILE to fill all three) shows up as "0 сделок" rather
+        than silently vanishing from the table."""
+        by_bucket = {row[0]: row[1:] for row in cur.fetchall()}
+        out = []
+        for key, label in ordered_labels.items():
+            total, wins, losses, net_pnl = by_bucket.get(key, (0, 0, 0, 0.0))
+            out.append({
+                "label": label, "trades": total, "wins": wins, "losses": losses,
+                "winrate_pct": (wins / total * 100) if total else 0.0, "net_pnl": net_pnl,
+            })
+        return out
+
+    def get_hourly_stats(self, strategy: Optional[str] = None) -> list[dict]:
+        """Win rate / PnL bucketed by the hour-of-day (UTC) a trade was
+        OPENED, over EVERY closed trade this DB has ever recorded (not
+        just this process's in-memory wallets, which lose their trade
+        history across a restart — see VirtualWallet/Engine's own
+        docstrings) — surfaces whether some hours are systematically
+        better/worse (e.g. thinner books during a particular session).
+        Always returns all 24 hours, zero-filled for ones with no trades
+        yet, so a quiet hour reads as "no data" rather than being
+        silently absent from the table."""
+        where = "WHERE closed_ts IS NOT NULL AND status IN ('won', 'lost') AND opened_ts IS NOT NULL"
+        params: list = []
+        if strategy:
+            where += " AND strategy = ?"
+            params.append(strategy)
+        cur = self._conn.execute(
+            f"SELECT CAST(strftime('%H', datetime(opened_ts, 'unixepoch')) AS INTEGER) AS hour, "
+            f"COUNT(*), SUM(CASE WHEN status='won' THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END), COALESCE(SUM(pnl_usd), 0) "
+            f"FROM trades {where} GROUP BY hour",
+            params,
+        )
+        by_hour = {row[0]: row[1:] for row in cur.fetchall()}
+        out = []
+        for h in range(24):
+            total, wins, losses, net_pnl = by_hour.get(h, (0, 0, 0, 0.0))
+            out.append({
+                "label": f"{h:02d}:00", "trades": total, "wins": wins, "losses": losses,
+                "winrate_pct": (wins / total * 100) if total else 0.0, "net_pnl": net_pnl,
+            })
+        return out
+
+    def get_volatility_regime_stats(self, strategy: Optional[str] = None) -> list[dict]:
+        """Win rate / PnL split into THREE roughly-equal-sized buckets
+        (terciles) of the realized-volatility estimate (checkpoint_features
+        .sigma_horizon_pct, scaled to each trade's own remaining horizon —
+        see fair_value_edge.py) captured at the exact moment each trade was
+        decided. Terciles rather than a fixed % threshold — this bot has
+        no prior idea what "high volatility" means in absolute terms for
+        this market, so the split just tracks whatever spread has actually
+        been observed. Only trades with a linked checkpoint_features row
+        (trade_id set — i.e. every trade that ever actually opened) count.
+        Always returns exactly 3 rows (Низкая/Средняя/Высокая), zero-filled
+        for a bucket NTILE hasn't populated yet (too little data so far)."""
+        where = "WHERE t.status IN ('won', 'lost') AND cf.sigma_horizon_pct IS NOT NULL"
+        params: list = []
+        if strategy:
+            where += " AND t.strategy = ?"
+            params.append(strategy)
+        cur = self._conn.execute(
+            "WITH ranked AS ("
+            "  SELECT t.status, t.pnl_usd, "
+            "         NTILE(3) OVER (ORDER BY cf.sigma_horizon_pct) AS bucket "
+            "  FROM trades t JOIN checkpoint_features cf ON cf.trade_id = t.id "
+            f" {where}"
+            ") "
+            "SELECT bucket, COUNT(*), SUM(CASE WHEN status='won' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN status='lost' THEN 1 ELSE 0 END), COALESCE(SUM(pnl_usd), 0) "
+            "FROM ranked GROUP BY bucket ORDER BY bucket",
+            params,
+        )
+        return self._bucket_rows(cur, {1: "Низкая", 2: "Средняя", 3: "Высокая"})
+
+    def get_trend_direction_stats(self, strategy: Optional[str] = None) -> list[dict]:
+        """Win rate / PnL split by whether BTC was trending up, down, or
+        flat (checkpoint_features.drift_5m_pct — % change over the 5
+        minutes before the trade was decided) at the moment each trade was
+        placed. TREND_DEADBAND_PCT is a starting heuristic (anything
+        smaller in magnitude just counts as noise, not a real trend), not
+        a tuned constant — revisit once enough live trades have
+        accumulated to see whether it's splitting the data sensibly. Only
+        trades with a linked checkpoint_features row count, same as
+        get_volatility_regime_stats."""
+        where = "WHERE t.status IN ('won', 'lost') AND cf.drift_5m_pct IS NOT NULL"
+        params: list = [TREND_DEADBAND_PCT, -TREND_DEADBAND_PCT]
+        if strategy:
+            where += " AND t.strategy = ?"
+            params.append(strategy)
+        cur = self._conn.execute(
+            "SELECT CASE WHEN cf.drift_5m_pct > ? THEN 'up' "
+            "            WHEN cf.drift_5m_pct < ? THEN 'down' ELSE 'flat' END AS bucket, "
+            "COUNT(*), SUM(CASE WHEN t.status='won' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN t.status='lost' THEN 1 ELSE 0 END), COALESCE(SUM(t.pnl_usd), 0) "
+            "FROM trades t JOIN checkpoint_features cf ON cf.trade_id = t.id "
+            f"{where} GROUP BY bucket",
+            params,
+        )
+        return self._bucket_rows(cur, {"up": "Рост", "flat": "Флэт", "down": "Падение"})
