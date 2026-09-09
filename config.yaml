@@ -327,7 +327,13 @@ strategies:
     min_abs_tfi: 0.5            # |TFI| must be at least this extreme to even consider a candidate
     min_prints: 8               # minimum executed trades in tfi_lookback_sec — too few is noise, not real pressure
     baseline_lookback_sec: 600  # 10 min — the volume/vol "normal" baseline Phase A's elevated-volume check compares against
-    min_volume_multiple: 1.5    # current window's trade rate must be at least this many times the baseline rate
+    min_volume_multiple: 1.3    # current window's trade rate must be at least this many times the baseline rate
+                                 # (was 1.5 — first ~70 checkpoints of live data showed this gate alone cutting
+                                 # roughly half of the candidates that had already cleared min_abs_tfi, second only
+                                 # to min_residual_pct; loosened here specifically because unlike min_abs_tfi/
+                                 # min_residual_pct it's a volume-activity check, not part of the core absorption
+                                 # definition — see scripts/analyze_absorption_funnel.py for how to re-check this
+                                 # funnel against fresh data)
     residual_sensitivity: 1.0   # how many realized-vol sigmas of "expected move" one full unit of TFI implies
     min_residual_pct: 0.03      # minimum actual-vs-expected divergence (in %) to call it absorption, not noise
     confirm_lookback_sec: 30    # Phase B: how far back to check the attacked book side hasn't drained
