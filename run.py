@@ -22,6 +22,8 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
+import aiohttp
+
 from src.config import load_config
 from src.engine import Engine
 from src.logger import setup_logging
@@ -436,6 +438,260 @@ async def check_ai_prompt(cfg) -> None:
         )
 
 
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+
+
+async def _fetch_binance_price(session: aiohttp.ClientSession, symbol: str = "BTCUSDT") -> Optional[float]:
+    """Binance's public spot ticker — no API key, no auth, same shape of
+    call as OKX's own unauthenticated market/ticker endpoint. Binance is
+    used as the "leader" reference here purely because it's the deepest,
+    most liquid BTC spot market by a wide margin — if ANY venue is setting
+    the pace of price discovery rather than following it, it's the most
+    likely candidate."""
+    try:
+        async with session.get(
+            BINANCE_TICKER_URL, params={"symbol": symbol}, timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+            return float(data["price"])
+    except (aiohttp.ClientError, TimeoutError, KeyError, ValueError, TypeError):
+        return None
+
+
+async def _fetch_okx_spot_price(client: OKXClient, inst_id: str) -> Optional[float]:
+    try:
+        data = await client.get_ticker(inst_id)
+    except Exception:
+        return None
+    if not data:
+        return None
+    try:
+        return float(data[0].get("last"))
+    except (TypeError, ValueError, KeyError, IndexError):
+        return None
+
+
+def _detect_impulses(
+    points: list[tuple[float, float]], threshold_pct: float, window_sec: float, cooldown_sec: float,
+) -> list[dict]:
+    """Walk a chronological (ts, price) series and flag "impulses": a move
+    of at least threshold_pct within a trailing window_sec window. After a
+    detected impulse, waits cooldown_sec before looking for the next one,
+    so one sustained move isn't counted dozens of times as price keeps
+    drifting through it. O(n) — the trailing window's left edge (`j`) only
+    ever moves forward, since points are chronological and the window is
+    fixed-width."""
+    impulses: list[dict] = []
+    last_impulse_ts = float("-inf")
+    j = 0
+    for i, (ts_i, price_i) in enumerate(points):
+        while points[j][0] < ts_i - window_sec:
+            j += 1
+        if ts_i - last_impulse_ts < cooldown_sec or j == i:
+            continue
+        ts_j, price_j = points[j]
+        if price_j <= 0:
+            continue
+        move_pct = (price_i - price_j) / price_j * 100
+        if abs(move_pct) >= threshold_pct:
+            impulses.append({
+                "start_ts": ts_j, "end_ts": ts_i,
+                "direction": "up" if move_pct > 0 else "down", "move_pct": move_pct,
+            })
+            last_impulse_ts = ts_i
+    return impulses
+
+
+def _measure_reaction_lag(
+    impulses: list[dict], reactor_points: list[tuple[float, float]], horizon_sec: float, react_threshold_pct: float,
+) -> list[Optional[float]]:
+    """For each impulse (detected on the LEADER series), find how many
+    seconds after it ended the reactor's own price shows a comparable
+    same-direction move. Returns 0.0 if the reactor had ALREADY moved by
+    the time the impulse ended (checked against the reactor's own price
+    at the impulse's START — real zero-lag/no-lag case, the actual
+    "nothing to exploit" outcome we're hoping to distinguish from "never
+    reacted"), the delay in seconds if it reacted later within
+    horizon_sec, or None if it never moved that much within horizon_sec.
+
+    Getting the zero-lag case right matters: without it, "OKX reacted
+    instantly" and "OKX never reacted at all" both come out as None —
+    conflating the two most different possible answers into one."""
+    lags: list[Optional[float]] = []
+    for imp in impulses:
+        start_ts, end_ts, direction = imp["start_ts"], imp["end_ts"], imp["direction"]
+
+        pre_price, base_price = None, None
+        for ts, price in reactor_points:
+            if ts <= start_ts:
+                pre_price = price
+            if ts <= end_ts:
+                base_price = price
+            else:
+                break
+        if base_price is None or base_price <= 0:
+            lags.append(None)
+            continue
+
+        if pre_price is not None and pre_price > 0:
+            already_pct = (base_price - pre_price) / pre_price * 100
+            if (direction == "up" and already_pct >= react_threshold_pct) or (
+                direction == "down" and already_pct <= -react_threshold_pct
+            ):
+                lags.append(0.0)
+                continue
+
+        found = None
+        for ts, price in reactor_points:
+            if ts <= end_ts:
+                continue
+            if ts - end_ts > horizon_sec:
+                break
+            move_pct = (price - base_price) / base_price * 100
+            if (direction == "up" and move_pct >= react_threshold_pct) or (
+                direction == "down" and move_pct <= -react_threshold_pct
+            ):
+                found = ts - end_ts
+                break
+        lags.append(found)
+    return lags
+
+
+async def check_leadlag(
+    cfg, duration_sec: float = 300.0, poll_interval_sec: float = 1.0,
+    impulse_threshold_pct: float = 0.03, window_sec: float = 10.0,
+    lag_horizon_sec: float = 20.0, react_threshold_pct: Optional[float] = None,
+) -> None:
+    """Utility mode: measure whether OKX's own spot BTC-USDT ticker lags
+    Binance's (the deepest/most liquid BTC market) — the first, cleanest
+    question to answer before building any cross-exchange lead-lag
+    strategy. No API keys needed at all: both are public, unauthenticated
+    tickers.
+
+    Method: poll both venues every poll_interval_sec for duration_sec,
+    detect "impulse" moves on Binance (>= impulse_threshold_pct within a
+    trailing window_sec window — same impulse+retest style detection as
+    breakout_common.py, applied here to find events rather than trade
+    signals), then measure how many seconds later (if at all, within
+    lag_horizon_sec) OKX's own spot price makes a comparable same-direction
+    move. This is a REAL measurement, not a guess — reports "no usable
+    lag" just as readily as "here's a real lag", and says so explicitly.
+
+    Deliberately scoped to spot-vs-spot only, NOT the event contract's own
+    `up_price` — that's a separate, nonlinear quantity (function of both
+    price distance from strike AND time-to-expiry, not price alone), and
+    conflating the two in one measurement would make the result ambiguous.
+    If this shows a real, exploitable spot lag, measuring up_price's own
+    reaction time is the natural follow-up — worth a second command, not
+    bolted onto this one.
+    """
+    if react_threshold_pct is None:
+        react_threshold_pct = impulse_threshold_pct * 0.5
+
+    client_cfg = OKXClientConfig(
+        base_url=cfg.okx.base_url, api_key=cfg.okx.api_key, api_secret=cfg.okx.api_secret,
+        api_passphrase=cfg.okx.api_passphrase, demo_trading=cfg.okx.demo_trading,
+        timeout_sec=cfg.okx.request_timeout_sec, max_retries=cfg.okx.max_retries,
+    )
+
+    print(
+        f"Collecting {duration_sec:.0f}s of Binance vs OKX spot BTC-USDT ({cfg.okx.underlying_inst_id}), "
+        f"polling every {poll_interval_sec:.1f}s — no API keys needed, both are public tickers.\n"
+    )
+
+    binance_series: list[tuple[float, float]] = []
+    okx_series: list[tuple[float, float]] = []
+
+    async with OKXClient(client_cfg) as okx_client, aiohttp.ClientSession() as binance_session:
+        end_at = time.time() + duration_sec
+        n = 0
+        while time.time() < end_at:
+            tick_start = time.time()
+            binance_price, okx_price = await asyncio.gather(
+                _fetch_binance_price(binance_session), _fetch_okx_spot_price(okx_client, cfg.okx.underlying_inst_id),
+            )
+            now = time.time()
+            if binance_price is not None:
+                binance_series.append((now, binance_price))
+            if okx_price is not None:
+                okx_series.append((now, okx_price))
+            n += 1
+            if n % 30 == 0:
+                remaining = max(0.0, end_at - time.time())
+                print(f"  ...{n} samples so far, ~{remaining:.0f}s left")
+            elapsed = time.time() - tick_start
+            await asyncio.sleep(max(0.0, poll_interval_sec - elapsed))
+
+    print(f"\nCollected {len(binance_series)} Binance samples, {len(okx_series)} OKX samples.")
+    if len(binance_series) < 10 or len(okx_series) < 10:
+        print("Not enough data to analyze (too many failed requests?) — check network/API access and retry.")
+        return
+
+    impulses = _detect_impulses(binance_series, impulse_threshold_pct, window_sec, cooldown_sec=window_sec)
+    print(
+        f"\nDetected {len(impulses)} impulses on Binance "
+        f"(>= {impulse_threshold_pct:.3f}% move within {window_sec:.0f}s, "
+        f"{window_sec:.0f}s cooldown between detections):"
+    )
+    for imp in impulses:
+        t = time.strftime("%H:%M:%S", time.localtime(imp["end_ts"]))
+        print(f"  {t}  {imp['direction'].upper():5s}  move={imp['move_pct']:+.3f}%")
+
+    if not impulses:
+        print(
+            "\nNo impulses detected in this window — try a longer --duration-sec, run during a more "
+            "volatile period, or lower --impulse-threshold-pct. Can't measure a lag with no events to "
+            "measure it from."
+        )
+        return
+
+    lags = _measure_reaction_lag(impulses, okx_series, lag_horizon_sec, react_threshold_pct)
+    print(
+        f"\nOKX spot reaction (>= {react_threshold_pct:.3f}% same-direction move within "
+        f"{lag_horizon_sec:.0f}s of the Binance impulse):"
+    )
+    for imp, lag in zip(impulses, lags):
+        lag_str = f"{lag:.1f}s later" if lag is not None else f"no reaction within {lag_horizon_sec:.0f}s"
+        print(f"  Binance {imp['direction'].upper():5s} {imp['move_pct']:+.3f}%  ->  OKX: {lag_str}")
+
+    reacted = sorted(l for l in lags if l is not None)
+    print(f"\n{'=' * 64}\nSummary\n{'=' * 64}")
+    if not reacted:
+        print(
+            f"0/{len(impulses)} impulses got any OKX reaction within {lag_horizon_sec:.0f}s — either OKX "
+            f"didn't move at all, or it reacted too fast/too small to separate from noise at this "
+            f"threshold. Inconclusive either way — try a lower --react-threshold-pct or a longer "
+            f"--lag-horizon-sec before concluding there's nothing here."
+        )
+        return
+
+    median = reacted[len(reacted) // 2]
+    print(
+        f"{len(reacted)}/{len(impulses)} impulses got an OKX reaction within {lag_horizon_sec:.0f}s.\n"
+        f"lag (seconds):  min={min(reacted):.1f}  median={median:.1f}  "
+        f"mean={sum(reacted) / len(reacted):.1f}  max={max(reacted):.1f}"
+    )
+    if median < poll_interval_sec * 1.5:
+        print(
+            "\n-> OKX reacts about as fast as our own polling resolution can even distinguish — no "
+            "usable lag visible at this measurement granularity. Consistent with OKX spot being just "
+            "as fast/liquid as Binance (expected for a top-tier BTC/USDT pair — real arbitrageurs keep "
+            "them in sync to milliseconds, well below what REST polling can see)."
+        )
+    else:
+        print(
+            f"\n-> OKX spot appears to lag Binance by ~{median:.1f}s on average — POTENTIALLY real. "
+            f"Caveats before building anything on this: (1) this measured raw SPOT price only, NOT the "
+            f"event contract's own up_price (a separate, nonlinear quantity — measure that specifically "
+            f"next); (2) a handful of impulses isn't a lot of samples — rerun with a longer "
+            f"--duration-sec / during more volatile periods to see if this holds up; (3) even a real "
+            f"few-second lag may not survive execution latency + the slippage we already measured with "
+            f"--check-liquidity."
+        )
+
+
 async def run_bot(cfg) -> None:
     storage = Storage(cfg.storage.data_dir)
 
@@ -558,6 +814,36 @@ def main() -> None:
              "checkpoints or the call cooldown",
     )
     parser.add_argument(
+        "--check-leadlag", action="store_true",
+        help="measure whether OKX's own spot BTC-USDT ticker lags Binance's — no API keys "
+             "needed (both public tickers). Prints detected Binance impulses and how long OKX "
+             "took to react to each, then a summary; exits after --duration-sec",
+    )
+    parser.add_argument(
+        "--duration-sec", type=float, default=300.0, metavar="SEC",
+        help="how long to collect data for --check-leadlag (default: 300 = 5 min)",
+    )
+    parser.add_argument(
+        "--poll-interval-sec", type=float, default=1.0, metavar="SEC",
+        help="polling interval for --check-leadlag (default: 1.0 — this is the measurement's "
+             "own time resolution, a detected lag shorter than this isn't distinguishable from noise)",
+    )
+    parser.add_argument(
+        "--impulse-threshold-pct", type=float, default=0.03, metavar="PCT",
+        help="minimum %% move within --window-sec on Binance to count as an impulse worth "
+             "measuring a reaction to, for --check-leadlag (default: 0.03)",
+    )
+    parser.add_argument(
+        "--window-sec", type=float, default=10.0, metavar="SEC",
+        help="trailing window --check-leadlag looks for an impulse within, and the cooldown "
+             "before it looks for the next one (default: 10)",
+    )
+    parser.add_argument(
+        "--lag-horizon-sec", type=float, default=20.0, metavar="SEC",
+        help="how long after a Binance impulse --check-leadlag keeps watching OKX for a "
+             "reaction before giving up on that impulse (default: 20)",
+    )
+    parser.add_argument(
         "--reset-data", action="store_true",
         help="wipe data/bot.db (all strategies), then exit "
              "(equivalent to the web dashboard's Reset DB button, for console-mode users)",
@@ -589,6 +875,14 @@ def main() -> None:
 
     if args.check_ai_prompt:
         asyncio.run(check_ai_prompt(cfg))
+        return
+
+    if args.check_leadlag:
+        asyncio.run(check_leadlag(
+            cfg, duration_sec=args.duration_sec, poll_interval_sec=args.poll_interval_sec,
+            impulse_threshold_pct=args.impulse_threshold_pct, window_sec=args.window_sec,
+            lag_horizon_sec=args.lag_horizon_sec,
+        ))
         return
 
     if args.reset_data:
