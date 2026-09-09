@@ -85,6 +85,10 @@ class Engine:
         enabled_names = self.cfg.enabled_strategy_names()
         if not enabled_names:
             raise RuntimeError("No strategies enabled in config.yaml — nothing to run.")
+        # One query up front rather than one per strategy — cheap, and
+        # keeps _build_wallets_and_strategies() the single place that
+        # decides "restore vs fresh start" for every wallet at once.
+        saved_wallets = self.storage.load_wallets()
         for s_cfg in self.cfg.strategies:
             if not s_cfg.enabled:
                 continue
@@ -93,7 +97,7 @@ class Engine:
             # one shared pool. That's what makes a fair head-to-head
             # comparison possible: every strategy is judged on the same
             # starting bankroll, not a fraction that shrinks as you enable more.
-            self.wallets[s_cfg.name] = VirtualWallet(strategy=s_cfg.name, initial_balance=s_cfg.deposit_usd)
+            self.wallets[s_cfg.name] = self._restore_or_create_wallet(s_cfg, saved_wallets.get(s_cfg.name))
 
             strat_cls = STRATEGY_REGISTRY.get(s_cfg.name)
             if strat_cls is None:
@@ -104,6 +108,41 @@ class Engine:
                 "Strategy '%s' ready: deposit=$%.2f windows=%s max_px=%.2f stake_frac=%.2f",
                 s_cfg.name, s_cfg.deposit_usd, s_cfg.entry_windows_min, s_cfg.max_coefficient, s_cfg.stake_fraction,
             )
+
+    @staticmethod
+    def _restore_or_create_wallet(s_cfg, saved: Optional[dict]) -> VirtualWallet:
+        """A fresh VirtualWallet(deposit_usd) if `saved` is None (first-ever
+        launch for this strategy, or one just reset) — otherwise resumes
+        the balance write_snapshot() persisted for it, so a redeploy/crash/
+        restart doesn't silently reset every strategy back to its starting
+        deposit while the Analytics tab (backed by the separately, every-
+        tick-persisted trades table) keeps remembering the full history.
+
+        initial_balance is restored too (not re-read from config) so
+        net_pnl/equity keep meaning "profit since this strategy's actual
+        first run", even across a config.yaml edit to deposit_usd later —
+        that's what the Reset button/`--reset-strategy` are for instead.
+
+        Any `reserved` capital (stake locked in trades that were still
+        open at the last snapshot) is folded back into balance rather than
+        restored as reserved: those specific Trade objects only ever lived
+        in memory and are gone after a restart, so nothing will ever
+        settle them and return that money on its own — leaving it in
+        `reserved` would just strand it there permanently. This is the
+        same "give the stake back, we can't confirm the outcome" logic
+        VirtualWallet.mark_unresolved() already uses for a settlement that
+        times out."""
+        if saved is None:
+            return VirtualWallet(strategy=s_cfg.name, initial_balance=s_cfg.deposit_usd)
+        wallet = VirtualWallet(strategy=s_cfg.name, initial_balance=saved["initial_balance"])
+        wallet.balance = saved["balance"] + saved["reserved"]
+        if saved["reserved"]:
+            logger.warning(
+                "Strategy '%s': restarted with $%.2f still reserved in-flight at the last "
+                "snapshot — refunded to balance (its open trade(s) can't be resumed across a restart).",
+                s_cfg.name, saved["reserved"],
+            )
+        return wallet
 
     # -- lifecycle ---------------------------------------------------------------
     def stop(self) -> None:
@@ -136,13 +175,21 @@ class Engine:
 
     def reset(self) -> None:
         """Wipe all wallets/trades/timing state back to a fresh start and
-        clear persisted history (trades.csv, state_snapshot.json). Safe to
-        call while the engine is running — it's synchronous and holds no
-        `await` points, so it can't race a concurrent `tick()` under
-        asyncio's single-threaded cooperative scheduling. Used by the web
-        dashboard's Reset button (`POST /api/reset`) and `run.py --reset-data`.
+        clear persisted history (the trades/wallets tables in data/bot.db).
+        Safe to call while the engine is running — it's synchronous and
+        holds no `await` points, so it can't race a concurrent `tick()`
+        under asyncio's single-threaded cooperative scheduling. Used by the
+        web dashboard's Reset button (`POST /api/reset`) and
+        `run.py --reset-data`.
         """
         old_strategies = list(self.strategy_instances.values())
+        # storage.reset() MUST run before _build_wallets_and_strategies():
+        # that method restores each wallet's balance from storage.
+        # load_wallets() when a saved row exists (see
+        # _restore_or_create_wallet) — wiping storage first is what makes
+        # "fresh wallets" actually mean fresh, instead of it immediately
+        # reloading the very balances this call is meant to erase.
+        self.storage.reset()
         self._build_wallets_and_strategies()  # fresh wallets AND fresh strategy instances
         self._close_strategies_soon(old_strategies)  # e.g. ai_prompt's old HTTP session
         self._settlement_attempts.clear()
@@ -151,7 +198,6 @@ class Engine:
         self._log_activity("*", "*", None, "no_signal", "База сброшена — журнал активности очищен")
         self.timing = EntryWindowManager()
         self._last_snapshot_write = 0.0
-        self.storage.reset()
         logger.warning("Engine reset: all wallets/trades/timing cleared, storage wiped.")
 
     def reset_strategy(self, name: str) -> None:

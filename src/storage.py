@@ -129,6 +129,20 @@ class Storage:
         )
         self._conn.commit()
 
+    def load_wallets(self) -> dict[str, dict]:
+        """Every wallet row this DB currently has, keyed by strategy name —
+        whatever write_snapshot() last wrote for it. Used by the engine at
+        startup to resume each strategy's balance instead of restarting it
+        at deposit_usd every time the process restarts (a redeploy, a
+        crash, `docker compose up --build`, ...); a strategy with no row
+        here (first-ever launch, or one just reset) simply gets no restore
+        and starts fresh from config as before."""
+        cur = self._conn.execute("SELECT strategy, initial_balance, balance, reserved FROM wallets")
+        return {
+            row[0]: {"initial_balance": row[1], "balance": row[2], "reserved": row[3]}
+            for row in cur.fetchall()
+        }
+
     # -- reset -------------------------------------------------------------------
     def reset(self) -> None:
         """Wipe ALL persisted history for every strategy. Used by the

@@ -85,6 +85,87 @@ class EngineResetStrategyTests(unittest.TestCase):
             engine.storage.close()
 
 
+class WalletRestoreOnStartupTests(unittest.TestCase):
+    """A redeploy/crash/restart used to silently reset every wallet back
+    to deposit_usd — write_snapshot() persisted balances to data/bot.db,
+    but nothing ever read them back on the next Engine(...). These cover
+    the fix: a new Engine instance sharing the same Storage should resume
+    where the last one left off, not restart from scratch."""
+
+    def _make_engine(self, tmp: Path) -> Engine:
+        cfg = make_config(tmp)
+        provider = MockMarketDataProvider(series_ids=cfg.okx.series_ids, seed=1)
+        storage = Storage(tmp)
+        return Engine(cfg, provider, storage)
+
+    def test_second_engine_resumes_balance_from_storage(self):
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine1 = self._make_engine(tmp_path)
+            engine1.wallets["breakout_retest"].balance = 142.5  # simulate accumulated profit
+            engine1.storage.write_snapshot(engine1.wallets)
+            engine1.storage.close()
+
+            # A brand new Engine, same data dir/DB — simulates the process
+            # restarting (redeploy) with the same persistent volume.
+            storage2 = Storage(tmp_path)
+            cfg2 = make_config(tmp_path)
+            provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
+            engine2 = Engine(cfg2, provider2, storage2)
+
+            self.assertEqual(engine2.wallets["breakout_retest"].balance, 142.5)
+            self.assertEqual(engine2.wallets["breakout_retest"].initial_balance, 100.0)
+            engine2.storage.close()
+
+    def test_reserved_capital_is_refunded_to_balance_on_restore(self):
+        # A trade was still open (stake reserved, not yet settled) at the
+        # moment of the last snapshot — that specific Trade object is gone
+        # after a restart, so nothing will ever settle it and return the
+        # stake on its own. It must come back to balance, not vanish.
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine1 = self._make_engine(tmp_path)
+            wallet = engine1.wallets["breakout_retest"]
+            wallet.balance = 80.0
+            wallet.reserved = 20.0  # e.g. one $20 stake still in flight
+            engine1.storage.write_snapshot(engine1.wallets)
+            engine1.storage.close()
+
+            storage2 = Storage(tmp_path)
+            cfg2 = make_config(tmp_path)
+            provider2 = MockMarketDataProvider(series_ids=cfg2.okx.series_ids, seed=1)
+            engine2 = Engine(cfg2, provider2, storage2)
+
+            restored = engine2.wallets["breakout_retest"]
+            self.assertEqual(restored.balance, 100.0)  # 80 + the refunded 20
+            self.assertEqual(restored.reserved, 0.0)
+            engine2.storage.close()
+
+    def test_engine_reset_wipes_storage_before_rebuilding_wallets(self):
+        # Regression guard for the ordering bug this restore feature could
+        # introduce: reset() must clear storage BEFORE rebuilding wallets,
+        # or the rebuild would immediately reload the very balance the
+        # reset is supposed to erase (load_wallets() would still see it).
+        with TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            engine = self._make_engine(tmp_path)
+            engine.wallets["breakout_retest"].balance = 55.0
+            engine.storage.write_snapshot(engine.wallets)
+
+            engine.reset()
+
+            self.assertEqual(engine.wallets["breakout_retest"].balance, 100.0)
+            self.assertEqual(engine.storage.load_wallets(), {})  # nothing left to restore either
+            engine.storage.close()
+
+    def test_no_saved_row_starts_fresh_from_config(self):
+        with TemporaryDirectory() as tmp:
+            engine = self._make_engine(Path(tmp))  # nothing ever written to storage
+            self.assertEqual(engine.wallets["breakout_retest"].balance, 100.0)
+            self.assertEqual(engine.wallets["breakout_retest"].initial_balance, 100.0)
+            engine.storage.close()
+
+
 class EngineOpenTradeUsesHonestFillPriceTests(unittest.IsolatedAsyncioTestCase):
     """Confirms the actual wiring in _open_due_trades — not just
     EventMarket.fill_price_for in isolation — uses the honest,

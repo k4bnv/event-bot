@@ -7,8 +7,9 @@ Entry point.
     python run.py --discover-series   # print live OKX EVENTS series/instruments and exit
                                        # (helps you fill in okx.series_ids in config.yaml)
 
-Ctrl+C stops cleanly: the engine finishes its current tick, writes a final
-state snapshot to data/state_snapshot.json, and exits.
+Ctrl+C (and, since wallet balances now survive a redeploy, a `docker stop`/
+`docker compose up --build` SIGTERM too) stops cleanly: the engine finishes
+its current tick, writes a final wallet snapshot to data/bot.db, and exits.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import argparse
 import asyncio
 import csv
 import logging
+import signal
 import sys
 import time
 from collections import deque
@@ -1295,6 +1297,27 @@ async def _run_with_provider(cfg, provider, storage: Storage) -> None:
     if cfg.dashboard.mode == "web":
         print(f"Web dashboard: http://{cfg.dashboard.web_host}:{cfg.dashboard.web_port}")
 
+    # Docker sends SIGTERM (not SIGINT) to stop a container — e.g. every
+    # `docker compose up --build` on redeploy — and Python installs no
+    # default handler for it, so without this the process would just die
+    # mid-tick, skipping the `finally` block below entirely and losing up
+    # to snapshot_every_sec seconds of wallet state (closed trades are
+    # written every tick regardless, via _maybe_persist — that's why the
+    # Analytics tab never lost history even before this fix, only the
+    # wallet balances did). Wiring SIGTERM to the same cancellation path
+    # SIGINT/Ctrl+C already takes makes a redeploy behave like a clean
+    # stop: engine.stop() + one final storage.write_snapshot() before exit.
+    loop = asyncio.get_running_loop()
+
+    def _cancel_all(*_args) -> None:
+        for t in tasks:
+            t.cancel()
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, _cancel_all)
+    except (NotImplementedError, RuntimeError):
+        pass  # e.g. Windows — no graceful SIGTERM handling there, same as before this change
+
     try:
         await asyncio.gather(*tasks)
     except asyncio.CancelledError:
@@ -1515,7 +1538,7 @@ def main() -> None:
     try:
         asyncio.run(run_bot(cfg))
     except KeyboardInterrupt:
-        print("\nStopped by user. Final state saved to data/state_snapshot.json and data/trades.csv.")
+        print("\nStopped by user. Final wallet/trade state saved to data/bot.db.")
 
 
 if __name__ == "__main__":
