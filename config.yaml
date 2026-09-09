@@ -9,7 +9,7 @@
 # false -> pulls real BTC/USDT market data from OKX (public, unauthenticated,
 #          rock-solid v5 endpoints) and real Event-Contract quotes from OKX
 #          Demo Trading (instType=EVENTS). See README "Event Contracts caveat".
-mock_mode: true
+mock_mode: false
 
 okx:
   underlying_inst_id: "BTC-USDT"        # standard spot pair used for strategy signals
