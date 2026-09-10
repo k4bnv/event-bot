@@ -66,7 +66,20 @@ strategies:
     display_name: "A: Breakout & Retest"
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]     # minutes-to-expiry entry checkpoints
-    max_coefficient: 0.55             # never buy a contract priced above this
+    # Was 0.55: first ~9h live, decision_breakdown.py showed 26 of the 28
+    # genuine impulse+retest signals found (93%) thrown away purely on
+    # price, at a median rejected price of 0.91 (p75=0.96, p90=0.98,
+    # max=0.99) — this strategy tends to only confirm its pattern once
+    # the move is nearly fully priced in. Raising all the way to capture
+    # that distribution would mean routinely buying near-certain
+    # contracts, exactly the failure mode favorite_bias just showed
+    # (high winrate can still lose money if the price paid is even
+    # higher) — but there's no winrate data yet for THIS strategy at
+    # those prices, since it's never taken one. Nudged modestly instead
+    # of chasing the full distribution — re-run decision_breakdown.py
+    # after this has run a while to see whether the newly-captured
+    # trades (~0.55-0.65) are actually profitable before pushing further.
+    max_coefficient: 0.65
     stake_fraction: 0.01              # fraction of strategy wallet per trade
     impulse_lookback_sec: 90
     impulse_threshold_pct: 0.08       # % move that counts as an "impulse" (was 0.12 — 0 trades
@@ -80,7 +93,10 @@ strategies:
     display_name: "B: Momentum / Orderbook"
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
-    max_coefficient: 0.55
+    # Was 0.55 — same story as breakout_retest above: 142 of 188 found
+    # signals (76%) rejected on price, median rejected 0.89 (p75=0.97,
+    # p90=0.98). Modest bump only, same caution as A — see its comment.
+    max_coefficient: 0.65
     stake_fraction: 0.01
     orderbook_depth_levels: 10
     imbalance_threshold: 1.8          # bid-volume / ask-volume ratio to trigger
@@ -107,7 +123,10 @@ strategies:
     display_name: "D: Volatility-Adaptive Breakout"
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
-    max_coefficient: 0.55
+    # Was 0.55 — same story as breakout_retest above: 14 of 16 found
+    # signals (87.5%) rejected on price, median rejected 0.935 (p75=0.97,
+    # p90=0.99). Modest bump only, same caution as A — see its comment.
+    max_coefficient: 0.65
     stake_fraction: 0.01
     breakout_lookback_sec: 60           # window checked for the impulse+retest itself
     vol_lookback_sec: 300               # baseline window BEFORE that, used only to size the threshold
@@ -122,7 +141,18 @@ strategies:
     display_name: "E: Fair-Value / Probability Edge"
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
-    max_coefficient: 0.7               # this strategy trades edge, not cheapness — allow pricier contracts
+    # Was 0.7: first ~9h live, decision_breakdown.py showed 88 of 134
+    # found edges (66%) rejected on price, median rejected 0.90
+    # (p75=0.975, p90=0.98). Raised more confidently than
+    # breakout_retest/volatility_breakout/orderbook_momentum's own
+    # analogous bump (0.55->0.65) — unlike those, this strategy's signal
+    # is a genuine calibrated probability estimate (z-score/CDF vs OKX's
+    # own quoted price, not just a pattern trigger), so a "found edge at
+    # a high price" is more likely to reflect a real, quantified
+    # mispricing rather than just detecting the move after it's already
+    # nearly decided. Still not chasing the full rejected distribution
+    # up to 0.9+ in one step — revisit with fresh decision_breakdown data.
+    max_coefficient: 0.8               # this strategy trades edge, not cheapness — allow pricier contracts
     stake_fraction: 0.01
     lookback_sec: 120
     min_edge: 0.08                     # min |model_prob - market_px| to trade (0.08 = 8 percentage points)
@@ -141,7 +171,14 @@ strategies:
     entry_windows_min: [12, 7, 2]
     max_coefficient: 0.55
     stake_fraction: 0.01
-    funding_rate_threshold: 0.0003     # fraction; 0.0003 = 0.03% per funding interval
+    # Was 0.0003 (0.03%): first ~9h live, checkpoint_features' logged
+    # funding_rate for this strategy ranged only ~0.000041-0.0001 (0.004%
+    # to 0.01%) the whole night — genuinely never got anywhere near the
+    # old threshold, not a data-fetch problem (hundreds of distinct real
+    # values logged). Set to sit in the upper ~20-25% of that night's own
+    # observed range — still requires meaningfully elevated funding
+    # relative to what's typical, not "any nonzero reading."
+    funding_rate_threshold: 0.00007    # fraction; 0.00007 = 0.007% per funding interval
 
   # Costs money per call and needs an API key (see .env.example) — enabled
   # here for this deployment (verified working end-to-end via
