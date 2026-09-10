@@ -151,6 +151,25 @@ class FeaturesExportTests(unittest.TestCase):
             self.assertEqual(resp_a.json()["count"], 2)
             engine.storage.close()
 
+    def test_reset_endpoint_wipes_checkpoint_features_only(self):
+        with TemporaryDirectory() as tmp:
+            app, engine = make_app(Path(tmp))
+            client = TestClient(app)
+            engine.storage.log_checkpoint_features(make_feature_row(id_="f1", strategy="a"))
+            engine.storage.log_checkpoint_features(make_feature_row(id_="f2", strategy="b"))
+
+            wallet_12 = engine.wallet_for("breakout_retest", 12)
+            t = make_trade("breakout_retest", 12)
+            wallet_12.open_trade(t)
+            wallet_12.settle_trade(t, won=True)
+
+            resp = client.post("/api/features/reset")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.json()["deleted"], 2)
+            self.assertEqual(engine.storage.count_checkpoint_features(), 0)
+            self.assertEqual(len(wallet_12.trades), 1)  # wallet/trade untouched
+            engine.storage.close()
+
 
 class DecisionBreakdownEndpointTests(unittest.TestCase):
     """Covers /api/diagnostics/decision_breakdown — backs the dashboard's

@@ -19,8 +19,12 @@ okx:
   # but exact frequencies offered (5min/15min/1H/...) can change — run
   # `python run.py --discover-series` (needs API keys, see README) to print
   # what's currently live on your account and paste the exact values here.
+  # 5MIN removed 2026-09-10 at the user's request — only 15MIN markets
+  # traded now. Every strategy's entry_windows_min was already written to
+  # work correctly across mixed series lengths (see timing.py's module
+  # docstring for the real bug that was found and fixed there), so this
+  # is a pure config change — no strategy code assumes 5MIN exists.
   series_ids:
-    - "BTC-UPDOWN-5MIN"
     - "BTC-UPDOWN-15MIN"
   poll_interval_sec: 3
   request_timeout_sec: 10

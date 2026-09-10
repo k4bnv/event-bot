@@ -159,11 +159,11 @@ INDEX_HTML = """<!doctype html>
   .leader { font-size:13px; line-height:1.9; }
   .badge { display:inline-block; padding:2px 8px; border-radius:6px; background:#23262e; font-size:11px; margin-left:8px; }
   .topbar { display:flex; align-items:baseline; justify-content:space-between; gap:12px; flex-wrap:wrap; }
-  #resetBtn { background:#3a1f1f; color:#ff9f9f; border:1px solid #6b2b2b; border-radius:6px;
+  #resetBtn, #resetFeaturesBtn { background:#3a1f1f; color:#ff9f9f; border:1px solid #6b2b2b; border-radius:6px;
               padding:6px 12px; font-size:12px; cursor:pointer; }
-  #resetBtn:hover { background:#4a2626; }
-  #resetBtn:disabled { opacity:0.5; cursor:default; }
-  #resetMsg { font-size:12px; color:#9aa0a6; margin-left:10px; }
+  #resetBtn:hover, #resetFeaturesBtn:hover { background:#4a2626; }
+  #resetBtn:disabled, #resetFeaturesBtn:disabled { opacity:0.5; cursor:default; }
+  #resetMsg, #resetFeaturesMsg { font-size:12px; color:#9aa0a6; margin-left:10px; }
   #logoutBtn { background:#171a21; color:#9aa0a6; border:1px solid #23262e; border-radius:6px;
                padding:6px 12px; font-size:12px; cursor:pointer; margin-right:6px; }
   #logoutBtn:hover { background:#1f232b; }
@@ -318,9 +318,13 @@ INDEX_HTML = """<!doctype html>
     <div class="card">
       <h3>Данные для обучения (ML)</h3>
       <p class="chart-note">Полный лог каждой оценки чекпоинта (в т.ч. когда сигнала не было) —
-        см. таблицу checkpoint_features. Строк: <span id="featuresCount">…</span></p>
+        см. таблицу checkpoint_features. Этот лог НЕ чистится обычным «Сбросить базу» (см. вкладку
+        Диагностика) — специально, чтобы обучающие данные не терялись при каждой перенастройке.
+        Строк: <span id="featuresCount">…</span></p>
       <div class="analytics-controls">
         <button id="exportFeaturesCsvBtn" onclick="exportFeaturesCsv()">⬇ Экспорт CSV для обучения</button>
+        <button id="resetFeaturesBtn" onclick="resetFeatures()">🗑 Сбросить ML-данные</button>
+        <span id="resetFeaturesMsg"></span>
       </div>
     </div>
   </div>
@@ -1048,6 +1052,27 @@ async function logout(){
   window.location.href = '/login';
 }
 
+async function resetFeatures(){
+  if(!confirm('Стереть ВСЮ таблицу checkpoint_features (данные для обучения)? Кошельки и история ' +
+              'сделок НЕ тронутся — это отдельный лог. Действие необратимо.')) return;
+  const btn = document.getElementById('resetFeaturesBtn');
+  const msg = document.getElementById('resetFeaturesMsg');
+  btn.disabled = true;
+  msg.textContent = 'сбрасываю…';
+  try {
+    const r = await fetch('/api/features/reset', { method: 'POST' });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error || ('HTTP ' + r.status));
+    msg.textContent = `готово ✓ (удалено строк: ${j.deleted})`;
+    await loadFeaturesCount();
+  } catch (e) {
+    msg.textContent = 'ошибка: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    setTimeout(() => { msg.textContent = ''; }, 5000);
+  }
+}
+
 async function resetDb(){
   if(!confirm('Сбросить базу? Все виртуальные кошельки, сделки и история (data/bot.db) будут ' +
               'стёрты и стратегии начнут заново со своим текущим депозитом. Действие необратимо.')) return;
@@ -1391,6 +1416,18 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
     @app.get("/api/features/count")
     async def features_count(strategy: Optional[str] = None) -> JSONResponse:
         return JSONResponse({"count": engine.storage.count_checkpoint_features(strategy=strategy)})
+
+    @app.post("/api/features/reset")
+    async def reset_features() -> JSONResponse:
+        """Wipe checkpoint_features specifically — the one table the
+        regular Reset DB button deliberately leaves alone (see
+        Storage.reset's docstring). Separate, explicit action for when
+        the accumulated ML history itself is what needs to go (e.g. after
+        dropping 5MIN contracts made old rows no longer representative of
+        what's currently traded) — never a side effect of a balance
+        reset. Wallets/trades are untouched."""
+        deleted = engine.storage.reset_checkpoint_features()
+        return JSONResponse({"ok": True, "deleted": deleted, "reset_at": time.time()})
 
     @app.get("/api/diagnostics/decision_breakdown")
     async def diagnostics_decision_breakdown(hours: Optional[float] = None) -> JSONResponse:

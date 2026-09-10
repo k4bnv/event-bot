@@ -425,6 +425,23 @@ class Storage:
         self._conn.commit()
         logger.warning("Storage reset for strategy '%s' only (checkpoint_features kept).", strategy)
 
+    def reset_checkpoint_features(self) -> int:
+        """Wipe the ML feature-logging table specifically — the one thing
+        reset()/reset_strategy() deliberately leave alone (see reset()'s
+        docstring). Separate, explicit action: this is the actual
+        training-data log, not trading state, so it should only ever go
+        away on purpose (e.g. after a series/strategy-lineup change like
+        dropping 5MIN contracts made the accumulated history no longer
+        representative of what's currently being traded) — never as a
+        side effect of a routine balance reset. Returns the row count
+        deleted, purely for a confirmation message; wallets/trades are
+        untouched."""
+        count = self._conn.execute("SELECT COUNT(*) FROM checkpoint_features").fetchone()[0]
+        self._conn.execute("DELETE FROM checkpoint_features")
+        self._conn.commit()
+        logger.warning("Storage reset: wiped %d checkpoint_features rows from %s (trades/wallets kept).", count, self.db_path)
+        return count
+
     # -- reads (dashboard analytics) ------------------------------------------------
     def get_trades(
         self, strategy: Optional[str] = None, limit: Optional[int] = 200, offset: int = 0,

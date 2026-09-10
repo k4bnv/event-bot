@@ -353,6 +353,27 @@ class CheckpointFeaturesTests(unittest.TestCase):
             self.assertEqual(storage.count_checkpoint_features(), 1)
             storage.close()
 
+    def test_reset_checkpoint_features_wipes_only_that_table(self):
+        # The explicit, separate action reset()/reset_strategy() deliberately
+        # don't do — see reset_checkpoint_features's own docstring for why
+        # this needs to be its own call rather than a flag on reset().
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="f1", strategy="a"))
+            storage.log_checkpoint_features(make_feature_row(id_="f2", strategy="b"))
+            wallet = VirtualWallet(strategy="a", initial_balance=100.0)
+            trade = make_settled_trade()
+            wallet.open_trade(trade)
+            wallet.settle_trade(trade, won=True)
+            storage.append_closed_trades({"a": wallet})
+
+            deleted = storage.reset_checkpoint_features()
+
+            self.assertEqual(deleted, 2)
+            self.assertEqual(storage.count_checkpoint_features(), 0)
+            self.assertEqual(len(storage.get_trades()), 1)  # trades/wallets untouched
+            storage.close()
+
     def test_reset_strategy_does_not_wipe_checkpoint_features(self):
         with TemporaryDirectory() as tmp:
             storage = Storage(Path(tmp))
