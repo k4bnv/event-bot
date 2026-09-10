@@ -471,6 +471,39 @@ class DecisionBreakdownTests(unittest.TestCase):
             self.assertIsNone(storage.get_rejected_fill_price_stats("a"))
             storage.close()
 
+    def test_since_ts_excludes_stale_history(self):
+        # Live bug this was added for: checkpoint_features is never wiped
+        # by a Reset (unlike wallets/trades — see reset()'s docstring), so
+        # an all-time breakdown right after a reset (or a strategy logic
+        # change) silently counts evaluations from before it alongside
+        # whatever's actually happened since. since_ts is how the
+        # dashboard's Диагностика tab answers "is it alive RIGHT NOW"
+        # instead of "ever, across however much stale history remains".
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="old", strategy="a", ts=1000.0, decision="opened"))
+            storage.log_checkpoint_features(make_feature_row(id_="new", strategy="a", ts=5000.0, decision="no_signal"))
+
+            all_time = {r["strategy"]: r for r in storage.get_decision_breakdown()}
+            self.assertEqual(all_time["a"]["total"], 2)
+
+            recent = {r["strategy"]: r for r in storage.get_decision_breakdown(since_ts=4000.0)}
+            self.assertEqual(recent["a"]["total"], 1)
+            self.assertEqual(recent["a"]["decisions"], {"no_signal": 1})
+            storage.close()
+
+    def test_rejected_fill_price_stats_since_ts_excludes_stale_history(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            for i, price in enumerate([0.6, 0.7, 0.8]):
+                storage.log_checkpoint_features(make_feature_row(
+                    id_=f"old{i}", strategy="a", ts=1000.0,
+                    decision="rejected_max_coefficient", fill_price=price))
+
+            self.assertIsNotNone(storage.get_rejected_fill_price_stats("a"))  # enough all-time
+            self.assertIsNone(storage.get_rejected_fill_price_stats("a", since_ts=4000.0))  # none recent
+            storage.close()
+
 
 def make_closed_trade_with_features(
     storage: Storage, strategy: str = "a", won: bool = True, stake: float = 10.0,

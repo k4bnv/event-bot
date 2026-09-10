@@ -198,6 +198,29 @@ class DecisionBreakdownEndpointTests(unittest.TestCase):
             self.assertEqual(resp.json()["strategies"], [])
             engine.storage.close()
 
+    def test_hours_param_excludes_stale_history(self):
+        # Live bug this was added for: checkpoint_features survives a
+        # Reset (unlike wallets), so an all-time breakdown right after one
+        # silently mixes pre-reset evaluations into the count. `hours`
+        # lets the Диагностика tab show "alive right now" instead.
+        with TemporaryDirectory() as tmp:
+            app, engine = make_app(Path(tmp))
+            client = TestClient(app)
+            now = time.time()
+            engine.storage.log_checkpoint_features(
+                make_feature_row(id_="old", strategy="mean_reversion", ts=now - 10 * 3600, decision="opened"))
+            engine.storage.log_checkpoint_features(
+                make_feature_row(id_="new", strategy="mean_reversion", ts=now - 60, decision="no_signal"))
+
+            resp_all = client.get("/api/diagnostics/decision_breakdown")
+            self.assertEqual({r["strategy"]: r for r in resp_all.json()["strategies"]}["mean_reversion"]["total"], 2)
+
+            resp_6h = client.get("/api/diagnostics/decision_breakdown", params={"hours": 6})
+            row = {r["strategy"]: r for r in resp_6h.json()["strategies"]}["mean_reversion"]
+            self.assertEqual(row["total"], 1)
+            self.assertEqual(row["decisions"], {"no_signal": 1})
+            engine.storage.close()
+
 
 if __name__ == "__main__":
     unittest.main()

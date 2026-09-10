@@ -351,8 +351,18 @@ INDEX_HTML = """<!doctype html>
         scripts/decision_breakdown.py печатает из терминала, только без SSH. «Без сигнала» — своя
         логика входа стратегии ничего не нашла; «отклонено по цене» — сигнал был, но контракт стоил
         дороже max_coefficient (можно решить, подняв потолок — см. цены справа); «прочий отказ» —
-        технические причины (нет котировки/баланса/проскальзывание).</p>
+        технические причины (нет котировки/баланса/проскальзывание). Этот лог НЕ чистится при сбросе
+        базы — «За всё время» может смешивать историю до сброса/смены логики стратегии с текущей;
+        выбери период поуже, чтобы увидеть, что происходит прямо сейчас.</p>
       <div class="analytics-controls">
+        <label>Период:
+          <select id="diagPeriod" onchange="loadDiagnostics()">
+            <option value="">За всё время</option>
+            <option value="1">Последний час</option>
+            <option value="6" selected>Последние 6 часов</option>
+            <option value="24">Последние 24 часа</option>
+          </select>
+        </label>
         <button id="diagRefreshBtn" onclick="loadDiagnostics()">↻ Обновить</button>
       </div>
       <div class="legend" id="diagLegend"></div>
@@ -665,7 +675,9 @@ function bucketDecisions(decisions){
 }
 
 async function loadDiagnostics(){
-  const r = await fetch('/api/diagnostics/decision_breakdown');
+  const hours = document.getElementById('diagPeriod').value;
+  const url = '/api/diagnostics/decision_breakdown' + (hours ? `?hours=${hours}` : '');
+  const r = await fetch(url);
   const d = await r.json();
   renderDiagnostics(d.strategies || []);
 }
@@ -676,7 +688,8 @@ function renderDiagnostics(strategies){
   ).join('');
 
   if (strategies.length === 0) {
-    document.getElementById('diagTable').innerHTML = '<tr><td>Пока нет ни одной оценки чекпоинта.</td></tr>';
+    document.getElementById('diagTable').innerHTML =
+      '<tr><td>Нет оценок чекпоинта за выбранный период — попробуй «За всё время».</td></tr>';
     return;
   }
 
@@ -1380,15 +1393,25 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
         return JSONResponse({"count": engine.storage.count_checkpoint_features(strategy=strategy)})
 
     @app.get("/api/diagnostics/decision_breakdown")
-    async def diagnostics_decision_breakdown() -> JSONResponse:
+    async def diagnostics_decision_breakdown(hours: Optional[float] = None) -> JSONResponse:
         """Backs the Диагностика tab — the same per-strategy 'why is it
         (not) trading' breakdown scripts/decision_breakdown.py prints
         from a terminal, live in the dashboard instead. See that
-        script's docstring for what each decision value means."""
-        rows = engine.storage.get_decision_breakdown()
+        script's docstring for what each decision value means.
+
+        `hours` (omit for all-time): checkpoint_features is never wiped
+        by a Reset, so all-time counts silently mix evaluations from
+        before the strategy's wallet was last reset (or its logic last
+        changed) with its actual current trade history — see
+        Storage.get_decision_breakdown's docstring for the live case
+        that motivated this filter."""
+        since_ts = (time.time() - hours * 3600) if hours else None
+        rows = engine.storage.get_decision_breakdown(since_ts=since_ts)
         for row in rows:
             row["display_name"] = display_names.get(row["strategy"], row["strategy"])
-            row["rejected_price_stats"] = engine.storage.get_rejected_fill_price_stats(row["strategy"])
+            row["rejected_price_stats"] = engine.storage.get_rejected_fill_price_stats(
+                row["strategy"], since_ts=since_ts,
+            )
         return JSONResponse({"strategies": rows})
 
     @app.get("/api/activity")

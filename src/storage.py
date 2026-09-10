@@ -322,17 +322,38 @@ class Storage:
             cur = self._conn.execute("SELECT COUNT(*) FROM checkpoint_features")
         return cur.fetchone()[0]
 
-    def get_decision_breakdown(self) -> list[dict]:
+    def get_decision_breakdown(self, since_ts: Optional[float] = None) -> list[dict]:
         """Per-strategy `decision` counts, busiest strategy first — same
         idea as scripts/decision_breakdown.py (see that script's own
         docstring for what each decision value means), exposed here so
         the dashboard's Диагностика tab can show it live instead of
         needing SSH/sqlite3 access every time. Returns
         [{"strategy": ..., "total": ..., "decisions": {decision: count}}],
-        one entry per strategy that has ANY logged evaluations."""
-        cur = self._conn.execute(
-            "SELECT strategy, decision, COUNT(*) FROM checkpoint_features GROUP BY strategy, decision"
-        )
+        one entry per strategy that has ANY logged evaluations (in the
+        window, if `since_ts` is given).
+
+        `since_ts` matters more than it looks: checkpoint_features is
+        deliberately NEVER wiped by a Reset (see reset()'s docstring —
+        it's a market-conditions log for future ML work, not trading
+        state), but wallets/trades ARE wiped by one. All-time counts
+        after a reset silently mix evaluations from before it with the
+        wallet's actual (fresh, small) trade history — seen live: a
+        strategy's Диагностика row claimed dozens of "opened" while its
+        wallet showed zero trades, because most of that count predated
+        a reset (or, for mean_reversion specifically, predated its
+        direction flip — see that strategy's module docstring). Pass a
+        recent `since_ts` to answer "is it ACTUALLY alive right now"
+        instead of "ever, across however much history happens to still
+        be logged"."""
+        if since_ts is not None:
+            cur = self._conn.execute(
+                "SELECT strategy, decision, COUNT(*) FROM checkpoint_features WHERE ts >= ? "
+                "GROUP BY strategy, decision", (since_ts,),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT strategy, decision, COUNT(*) FROM checkpoint_features GROUP BY strategy, decision"
+            )
         by_strategy: dict[str, dict[str, int]] = {}
         for strategy, decision, count in cur.fetchall():
             by_strategy.setdefault(strategy, {})[decision or "(none)"] = count
@@ -343,18 +364,29 @@ class Storage:
         out.sort(key=lambda row: -row["total"])
         return out
 
-    def get_rejected_fill_price_stats(self, strategy: str, min_n: int = 3) -> Optional[dict]:
+    def get_rejected_fill_price_stats(
+        self, strategy: str, min_n: int = 3, since_ts: Optional[float] = None,
+    ) -> Optional[dict]:
         """Distribution (p50/p75/p90/max) of fill_price among this
         strategy's rejected_max_coefficient rows — what a genuine signal
         was priced at right before being thrown out purely for exceeding
         max_coefficient. None below `min_n` samples (too little to read
         anything into). See engine.py's _open_due_trades for where
-        fill_price gets logged on that decision specifically."""
-        cur = self._conn.execute(
-            "SELECT fill_price FROM checkpoint_features "
-            "WHERE strategy = ? AND decision = 'rejected_max_coefficient' AND fill_price IS NOT NULL",
-            (strategy,),
-        )
+        fill_price gets logged on that decision specifically. `since_ts`
+        — see get_decision_breakdown's docstring for why this matters
+        after a reset or a strategy-logic change."""
+        if since_ts is not None:
+            cur = self._conn.execute(
+                "SELECT fill_price FROM checkpoint_features WHERE strategy = ? "
+                "AND decision = 'rejected_max_coefficient' AND fill_price IS NOT NULL AND ts >= ?",
+                (strategy, since_ts),
+            )
+        else:
+            cur = self._conn.execute(
+                "SELECT fill_price FROM checkpoint_features "
+                "WHERE strategy = ? AND decision = 'rejected_max_coefficient' AND fill_price IS NOT NULL",
+                (strategy,),
+            )
         prices = sorted(row[0] for row in cur.fetchall())
         if len(prices) < min_n:
             return None
