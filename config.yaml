@@ -53,17 +53,24 @@ okx:
 # also changeable live from the web dashboard's "Депозит по стратегиям" panel
 # (applying there always resets, same as the Reset DB button — see README).
 #
-# max_slippage_pct (optional, not set by default): reject a signal if the
-# real book-simulated fill is more than this many PERCENT worse than the
-# quoted price — the paper-trading analog of the "max slippage" guard a
-# real OKX order lets you set before it refuses to fill. Unset = no limit
-# (only max_coefficient's absolute ceiling applies). Measured on live data
-# (see README "Ограничения"): median real slippage alone is already
-# +66-109%, so this is not a small tuning knob — e.g.
-# `max_slippage_pct: 100` already rejects roughly half of otherwise-valid
-# signals. Add it under any strategy below if you want it, e.g.:
-#   mean_reversion:
-#     max_slippage_pct: 150
+# max_slippage_pct: reject a signal if the real book-simulated fill is more
+# than this many PERCENT worse than the quoted price — the paper-trading
+# analog of the "max slippage" guard a real OKX order lets you set before
+# it refuses to fill. Unset = no limit (only max_coefficient's absolute
+# ceiling applies).
+#
+# Set to 25 on every strategy 2026-09-10. The earlier note here quoted a
+# median slippage of +66-109% and warned that `100` would reject half of
+# all signals — but those numbers came from simulating a $20 order, and
+# the bot actually stakes ~$1 (stake_fraction 0.01 of a ~$100 wallet). Re-
+# measured at the REAL stake size (`run.py --check-liquidity --test-stake 1
+# --samples 10`), slippage is a completely different animal:
+#     $20 order:  median +216.8%   max +70900%
+#     $1  order:  median  +11.4%   max     +30%
+# So 25 sits just above the observed tail: it rejects the handful of ticks
+# where the book momentarily falls apart, and leaves ordinary entries
+# alone. Do NOT copy the old "100 rejects half of everything" intuition
+# across — it was an artefact of measuring the wrong order size.
 strategies:
   breakout_retest:
     enabled: true
@@ -85,6 +92,7 @@ strategies:
     # trades (~0.55-0.65) are actually profitable before pushing further.
     max_coefficient: 0.65
     stake_fraction: 0.01              # fraction of strategy wallet per trade
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     impulse_lookback_sec: 90
     impulse_threshold_pct: 0.08       # % move that counts as an "impulse" (was 0.12 — 0 trades
                                        # in the first ~17h live; loosened to actually get signal)
@@ -102,6 +110,7 @@ strategies:
     # p90=0.98). Modest bump only, same caution as A — see its comment.
     max_coefficient: 0.65
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     orderbook_depth_levels: 10
     imbalance_threshold: 1.8          # bid-volume / ask-volume ratio to trigger
 
@@ -119,6 +128,7 @@ strategies:
     entry_windows_min: [7, 2]
     max_coefficient: 0.5
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     lookback_sec: 180
     extreme_zscore: 1.5               # |z| above this = "local extreme"
 
@@ -132,6 +142,7 @@ strategies:
     # p90=0.99). Modest bump only, same caution as A — see its comment.
     max_coefficient: 0.65
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     breakout_lookback_sec: 60           # window checked for the impulse+retest itself
     vol_lookback_sec: 300               # baseline window BEFORE that, used only to size the threshold
     vol_multiplier: 2.0                 # threshold = vol_multiplier * baseline realized_vol_pct (was 2.5)
@@ -158,6 +169,7 @@ strategies:
     # up to 0.9+ in one step — revisit with fresh decision_breakdown data.
     max_coefficient: 0.8               # this strategy trades edge, not cheapness — allow pricier contracts
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     lookback_sec: 120
     min_edge: 0.08                     # min |model_prob - market_px| to trade (0.08 = 8 percentage points)
     # Two robustness terms adapted from a comparable open-source Kalshi BTC
@@ -168,13 +180,33 @@ strategies:
     # min_sigma_pct_per_min: 0.035      # floor on realized vol (%/min) — stops a flat stretch making the model overconfident
     # unfixed_strike_basis_pct: 0.075   # extra uncertainty (log-scale %) applied when OKX hasn't fixed this window's reference yet
 
+  # DISABLED 2026-09-10 after ~6h live went 2W/24L (7.7% winrate, -$19
+  # across its three windows) — the worst performer in the bot by a wide
+  # margin, and the most active one, which is the giveaway.
+  #
+  # This is a self-inflicted result and worth recording honestly. Earlier
+  # the same day funding_rate_threshold was lowered 0.0003 -> 0.00007,
+  # because an overnight sample showed funding never once reached the old
+  # threshold (it ranged 0.000041-0.0001), so the strategy had produced
+  # literally zero signals. That reasoning was sound as far as it went —
+  # but 0.00007 sits in the upper ~25% of that observed range, which
+  # turned a never-fires signal into an almost-always-fires one, and 24
+  # trades at 7.7% say it has no predictive content at that level.
+  #
+  # The deeper finding, only visible with both sides measured: funding
+  # rate on this instrument is too FLAT to be a signal at all. It either
+  # fires constantly (no selectivity) or never (no trades) — there is no
+  # threshold in between where it's both rare and meaningful, because the
+  # data doesn't have that structure. Not a tuning problem. Re-enable only
+  # if a fresh sample shows funding actually developing a fat tail here.
   funding_skew:
-    enabled: true
+    enabled: false
     display_name: "F: Funding Rate Skew"
     deposit_usd: 100
     entry_windows_min: [12, 7, 2]
     max_coefficient: 0.55
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     # Was 0.0003 (0.03%): first ~9h live, checkpoint_features' logged
     # funding_rate for this strategy ranged only ~0.000041-0.0001 (0.004%
     # to 0.01%) the whole night — genuinely never got anywhere near the
@@ -218,6 +250,7 @@ strategies:
     entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
     max_coefficient: 0.6
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     # provider: requesty (router.requesty.ai, one key -> 600+ models, "provider/model"
     #           naming — https://docs.requesty.ai/features/supported-models) | deepseek
     #           (talks to DeepSeek directly, no router) | openai_compatible (any other
@@ -360,6 +393,7 @@ strategies:
     # actual thesis (buy the favorite once it's favored) is untouched.
     max_coefficient: 0.85
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     favorite_price_threshold: 0.70     # buy whichever side is priced >= this
 
   # Genuine control-group baseline, not a "real" strategy — see
@@ -374,6 +408,7 @@ strategies:
     entry_windows_min: [2]
     max_coefficient: 0.85
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
 
   # Same signal as favorite_bias (H) — ride whichever side the crowd
   # already favors once it clears favorite_price_threshold — but instead
@@ -405,6 +440,7 @@ strategies:
     entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
     max_coefficient: 0.85
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     favorite_price_threshold: 0.70
 
   # "Failed attack -> reversal": heavy real aggressor selling (from the
@@ -427,6 +463,7 @@ strategies:
     entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
     max_coefficient: 0.6
     stake_fraction: 0.01
+    max_slippage_pct: 25            # see the max_slippage_pct note above `strategies:`
     tfi_lookback_sec: 90        # Phase A: window for the Trade-Flow-Imbalance calc (60-120s per the original write-up)
     min_abs_tfi: 0.5            # |TFI| must be at least this extreme to even consider a candidate
     min_prints: 8               # minimum executed trades in tfi_lookback_sec — too few is noise, not real pressure
