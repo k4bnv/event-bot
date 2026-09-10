@@ -44,8 +44,8 @@ ML question below) filter, not a single indicator crossing:
 
 On the EV/p_BE framing and the ML question from the original write-up:
 this strategy emits a raw directional Signal + confidence like
-breakout_retest/orderbook_momentum/volatility_breakout do — NOT a
-calibrated win probability like fair_value_edge/adaptive_timing. The
+breakout_retest/orderbook_momentum/volatility_breakout/adaptive_timing
+do — NOT a calibrated win probability like fair_value_edge. The
 engine's existing max_coefficient gate (reject a signal priced too high)
 is this strategy's practical "don't pay more than the setup is worth"
 filter, same as every other directional strategy already relies on;

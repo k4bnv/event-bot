@@ -167,52 +167,67 @@ class FairValueEdgeStrategyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=0.5, floor_strike=None))))
 
 
-class AdaptiveTimingStrategyTests(unittest.IsolatedAsyncioTestCase):
-    """Same edge math as FairValueEdgeStrategy (deliberately — see the
-    module docstring), so the interesting behavior to test here is the
-    scanning/one-shot-per-market part, not the edge calculation itself
-    (already covered by FairValueEdgeMathTests/FairValueEdgeStrategyTests)."""
+def make_orderbook(bid_size: float, ask_size: float, price: float = 100.0) -> OrderBookSnapshot:
+    return OrderBookSnapshot(
+        ts=0.0, bids=[OrderBookLevel(price=price * 0.999, size=bid_size)],
+        asks=[OrderBookLevel(price=price * 1.001, size=ask_size)],
+    )
 
-    async def test_signals_up_when_model_prob_beats_market_price(self):
-        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
-        points = make_points(noisy)
-        market = make_market(up_price=0.20, floor_strike=100.0)
-        ctx = make_ctx(points, remaining_sec=120, market=market)
-        strategy = AdaptiveTimingStrategy(config={"min_edge": 0.08})
+
+class AdaptiveTimingStrategyTests(unittest.IsolatedAsyncioTestCase):
+    """Same imbalance signal as OrderbookMomentumStrategy (deliberately —
+    see the module docstring for why: swapped from fair_value_edge's edge
+    math to this at the user's request, 2026-09-10, keeping the scanning
+    shell), so the interesting behavior to test here is the
+    scanning/one-shot-per-market part as much as the signal itself."""
+
+    def _config(self):
+        return {"orderbook_depth_levels": 10, "imbalance_threshold": 1.8}
+
+    async def test_signals_up_on_strong_bid_imbalance(self):
+        book = make_orderbook(bid_size=10.0, ask_size=1.0)  # 10x >> 1.8x threshold
+        ctx = make_ctx([], orderbook=book, remaining_sec=120)
+        strategy = AdaptiveTimingStrategy(config=self._config())
         signal = await strategy.evaluate(ctx)
         self.assertIsNotNone(signal)
         self.assertEqual(signal.direction, Direction.UP)
 
-    async def test_no_signal_when_market_price_matches_model(self):
-        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
-        points = make_points(noisy)
-        market = make_market(up_price=0.5, floor_strike=100.0)
-        ctx = make_ctx(points, remaining_sec=120, market=market)
-        strategy = AdaptiveTimingStrategy(config={"min_edge": 0.08})
+    async def test_signals_down_on_strong_ask_imbalance(self):
+        book = make_orderbook(bid_size=1.0, ask_size=10.0)
+        ctx = make_ctx([], orderbook=book, remaining_sec=120)
+        strategy = AdaptiveTimingStrategy(config=self._config())
+        signal = await strategy.evaluate(ctx)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)
+
+    async def test_no_signal_when_book_is_balanced(self):
+        book = make_orderbook(bid_size=5.0, ask_size=4.5)  # ratio ~1.11, well under 1.8
+        ctx = make_ctx([], orderbook=book, remaining_sec=120)
+        strategy = AdaptiveTimingStrategy(config=self._config())
         self.assertIsNone(await strategy.evaluate(ctx))
 
-    async def test_no_signal_without_market_quote_or_strike(self):
-        points = make_points([100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)])
-        strategy = AdaptiveTimingStrategy(config={})
-        self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=None, floor_strike=100.0))))
-        self.assertIsNone(await strategy.evaluate(make_ctx(points, market=make_market(up_price=0.5, floor_strike=None))))
+    async def test_no_signal_without_orderbook(self):
+        strategy = AdaptiveTimingStrategy(config=self._config())
+        self.assertIsNone(await strategy.evaluate(make_ctx([], orderbook=None)))
+        self.assertIsNone(await strategy.evaluate(
+            make_ctx([], orderbook=OrderBookSnapshot(ts=0.0, bids=[], asks=[]))
+        ))
 
     async def test_already_open_this_market_suppresses_a_signal_it_would_otherwise_take(self):
         """The whole point of the scan: once it's placed one trade in a
         market, it must sit out every later checkpoint of that SAME
-        market even if the edge still (or again) looks good — otherwise
-        a strategy meant to enter at most once per market would stack
-        bets exactly like the fixed-checkpoint strategies do on purpose."""
-        noisy = [100 + (0.05 if i % 2 == 0 else -0.05) for i in range(20)]
-        points = make_points(noisy)
-        market = make_market(up_price=0.20, floor_strike=100.0)
-        strategy = AdaptiveTimingStrategy(config={"min_edge": 0.08})
+        market even if the imbalance still (or again) looks good —
+        otherwise a strategy meant to enter at most once per market would
+        stack bets exactly like the fixed-checkpoint strategies do on
+        purpose."""
+        book = make_orderbook(bid_size=10.0, ask_size=1.0)
+        strategy = AdaptiveTimingStrategy(config=self._config())
 
         # Without the flag, this exact same setup DOES signal (sanity check).
-        ctx_free = make_ctx(points, remaining_sec=120, market=market, already_open_this_market=False)
+        ctx_free = make_ctx([], orderbook=book, remaining_sec=120, already_open_this_market=False)
         self.assertIsNotNone(await strategy.evaluate(ctx_free))
 
-        ctx_committed = make_ctx(points, remaining_sec=90, market=market, already_open_this_market=True)
+        ctx_committed = make_ctx([], orderbook=book, remaining_sec=90, already_open_this_market=True)
         self.assertIsNone(await strategy.evaluate(ctx_committed))
 
 
