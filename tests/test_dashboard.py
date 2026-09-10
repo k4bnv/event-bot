@@ -152,5 +152,52 @@ class FeaturesExportTests(unittest.TestCase):
             engine.storage.close()
 
 
+class DecisionBreakdownEndpointTests(unittest.TestCase):
+    """Covers /api/diagnostics/decision_breakdown — backs the dashboard's
+    Диагностика tab (same data scripts/decision_breakdown.py prints from
+    a terminal, live in the dashboard instead)."""
+
+    def test_returns_display_name_and_decision_counts(self):
+        with TemporaryDirectory() as tmp:
+            app, engine = make_app(Path(tmp))
+            client = TestClient(app)
+            engine.storage.log_checkpoint_features(make_feature_row(id_="f1", strategy="breakout_retest", decision="no_signal"))
+            engine.storage.log_checkpoint_features(make_feature_row(id_="f2", strategy="breakout_retest", decision="opened"))
+
+            resp = client.get("/api/diagnostics/decision_breakdown")
+            self.assertEqual(resp.status_code, 200)
+            rows = {r["strategy"]: r for r in resp.json()["strategies"]}
+            row = rows["breakout_retest"]
+            self.assertEqual(row["display_name"], "A: Breakout & Retest")
+            self.assertEqual(row["total"], 2)
+            self.assertEqual(row["decisions"], {"no_signal": 1, "opened": 1})
+            engine.storage.close()
+
+    def test_includes_rejected_price_stats_only_when_enough_samples(self):
+        with TemporaryDirectory() as tmp:
+            app, engine = make_app(Path(tmp))
+            client = TestClient(app)
+            for i, price in enumerate([0.6, 0.7, 0.8]):
+                engine.storage.log_checkpoint_features(make_feature_row(
+                    id_=f"r{i}", strategy="breakout_retest", decision="rejected_max_coefficient", fill_price=price))
+            engine.storage.log_checkpoint_features(make_feature_row(
+                id_="r_sparse", strategy="mean_reversion", decision="rejected_max_coefficient", fill_price=0.9))
+
+            resp = client.get("/api/diagnostics/decision_breakdown")
+            rows = {r["strategy"]: r for r in resp.json()["strategies"]}
+            self.assertIsNotNone(rows["breakout_retest"]["rejected_price_stats"])
+            self.assertEqual(rows["breakout_retest"]["rejected_price_stats"]["n"], 3)
+            self.assertIsNone(rows["mean_reversion"]["rejected_price_stats"])
+            engine.storage.close()
+
+    def test_empty_when_nothing_logged_yet(self):
+        with TemporaryDirectory() as tmp:
+            app, engine = make_app(Path(tmp))
+            client = TestClient(app)
+            resp = client.get("/api/diagnostics/decision_breakdown")
+            self.assertEqual(resp.json()["strategies"], [])
+            engine.storage.close()
+
+
 if __name__ == "__main__":
     unittest.main()

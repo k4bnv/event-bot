@@ -216,6 +216,18 @@ INDEX_HTML = """<!doctype html>
   .live-dot { display:inline-block; width:8px; height:8px; border-radius:50%; background:#3ddc84;
     margin-left:6px; vertical-align:middle; animation: live-pulse 1.6s ease-in-out infinite; }
   @keyframes live-pulse { 0%,100% { opacity:1; } 50% { opacity:0.25; } }
+  /* Диагностика tab — a strategy's decision funnel as a 100%-stacked bar
+     (see renderDiagnostics): status-style semantic colors (good/quiet/
+     fixable-blocked/other-blocked), not the categorical identity PALETTE
+     — these four ARE state, not series identity. */
+  #diagTable td.diag-bar-cell { text-align:left; min-width:200px; }
+  .diag-stackbar { display:flex; height:16px; border-radius:4px; overflow:hidden; background:#0f1115; }
+  .diag-stackbar .seg { height:100%; }
+  .diag-stackbar .seg + .seg { margin-left:2px; }
+  .diag-price-stats { font-size:11px; color:#898781; white-space:nowrap; text-align:left !important; }
+  #diagRefreshBtn { background:#171a21; color:#7fc7ff; border:1px solid #2b4a6b; border-radius:6px;
+    padding:5px 12px; font-size:12px; cursor:pointer; }
+  #diagRefreshBtn:hover { background:#1f2e3a; }
   #clearLogsBtn { background:#171a21; color:#9aa0a6; border:1px solid #23262e; border-radius:6px;
     padding:5px 12px; font-size:12px; cursor:pointer; }
   #clearLogsBtn:hover { background:#1f232b; }
@@ -271,6 +283,7 @@ INDEX_HTML = """<!doctype html>
     <button id="tabAnalyticsBtn" class="tab-btn" onclick="showTab('analytics')">Аналитика</button>
     <button id="tabLogsBtn" class="tab-btn" onclick="showTab('logs')">Логи</button>
     <button id="tabSettingsBtn" class="tab-btn" onclick="showTab('settings')">Настройки стратегий</button>
+    <button id="tabDiagnosticsBtn" class="tab-btn" onclick="showTab('diagnostics')">Диагностика</button>
   </div>
 
   <div id="dashboardView">
@@ -281,7 +294,7 @@ INDEX_HTML = """<!doctype html>
 
   <div id="analyticsView" style="display:none;">
     <div class="card chart-card">
-      <h3>Кривая эквити по стратегиям</h3>
+      <h3>Кривая эквити по стратегиям, % от старта</h3>
       <div id="equityChart"></div>
       <div id="equityNote" class="chart-note"></div>
     </div>
@@ -329,6 +342,22 @@ INDEX_HTML = """<!doctype html>
     <div id="strategyCards">loading…</div>
     <button id="applyStrategyBtn" onclick="applyStrategySettings()">Применить (сброс всех данных)</button>
     <span id="strategySettingsMsg"></span>
+  </div>
+
+  <div id="diagnosticsView" style="display:none;">
+    <div class="card">
+      <h3>Почему стратегия (не) торгует</h3>
+      <p class="chart-note">Разбор каждой оценки чекпоинта по каждой стратегии — то же самое, что
+        scripts/decision_breakdown.py печатает из терминала, только без SSH. «Без сигнала» — своя
+        логика входа стратегии ничего не нашла; «отклонено по цене» — сигнал был, но контракт стоил
+        дороже max_coefficient (можно решить, подняв потолок — см. цены справа); «прочий отказ» —
+        технические причины (нет котировки/баланса/проскальзывание).</p>
+      <div class="analytics-controls">
+        <button id="diagRefreshBtn" onclick="loadDiagnostics()">↻ Обновить</button>
+      </div>
+      <div class="legend" id="diagLegend"></div>
+      <div class="table-scroll"><table id="diagTable"></table></div>
+    </div>
   </div>
 
 <script>
@@ -389,10 +418,12 @@ function showTab(tab){
   document.getElementById('analyticsView').style.display = tab === 'analytics' ? '' : 'none';
   document.getElementById('logsView').style.display = tab === 'logs' ? '' : 'none';
   document.getElementById('settingsView').style.display = tab === 'settings' ? '' : 'none';
+  document.getElementById('diagnosticsView').style.display = tab === 'diagnostics' ? '' : 'none';
   document.getElementById('tabDashboardBtn').classList.toggle('active', tab === 'dashboard');
   document.getElementById('tabAnalyticsBtn').classList.toggle('active', tab === 'analytics');
   document.getElementById('tabLogsBtn').classList.toggle('active', tab === 'logs');
   document.getElementById('tabSettingsBtn').classList.toggle('active', tab === 'settings');
+  document.getElementById('tabDiagnosticsBtn').classList.toggle('active', tab === 'diagnostics');
   if (tab === 'settings' && !strategySettingsLoaded) loadStrategySettings();
   if (tab === 'analytics') {
     if (!tradesFilterLoaded) loadTradesFilterOptions();
@@ -404,6 +435,7 @@ function showTab(tab){
     if (!logsFilterLoaded) loadLogsFilterOptions();
     renderActivityLog();
   }
+  if (tab === 'diagnostics') loadDiagnostics();
 }
 
 async function loadLogsFilterOptions(){
@@ -602,6 +634,76 @@ async function loadFeaturesCount(){
   document.getElementById('featuresCount').textContent = d.count.toLocaleString('ru-RU');
 }
 
+// Диагностика tab — the same per-strategy "why is it (not) trading"
+// breakdown scripts/decision_breakdown.py prints from a terminal (see
+// its docstring for what each raw `decision` value means), live in the
+// dashboard. Collapsed from up to 9 raw decision strings into 4
+// semantic, STATUS-colored buckets (this is state, not series identity
+// — see the dataviz skill: status tokens are reserved for state and
+// never reused as "series N"): a 9-hue categorical legend would blur
+// past the palette's own 8-color CVD-safe limit for no real benefit,
+// since most of those 9 raw values are rare technical edge cases
+// (no live quote / balance too small / slippage) that read the same
+// either way — "blocked, not interesting right now" — while the one
+// genuinely actionable rejection (priced out by max_coefficient) gets
+// its own distinct color precisely because it's the one worth acting on.
+const DIAG_COLORS = { opened: STATUS_GOOD, quiet: '#5a5d63', blocked_price: '#c98500', blocked_other: STATUS_BAD };
+const DIAG_LABELS = {
+  opened: 'Открыто', quiet: 'Без сигнала / уже в позиции',
+  blocked_price: 'Отклонено по цене (max_coefficient)', blocked_other: 'Прочий отказ',
+};
+
+function bucketDecisions(decisions){
+  const out = { opened: 0, quiet: 0, blocked_price: 0, blocked_other: 0 };
+  for (const [decision, count] of Object.entries(decisions)) {
+    if (decision === 'opened') out.opened += count;
+    else if (decision === 'no_signal' || decision === 'skipped_already_positioned') out.quiet += count;
+    else if (decision === 'rejected_max_coefficient') out.blocked_price += count;
+    else out.blocked_other += count;   // rejected_no_quote/low_balance/no_fill_price/max_slippage/insufficient_funds/unknown
+  }
+  return out;
+}
+
+async function loadDiagnostics(){
+  const r = await fetch('/api/diagnostics/decision_breakdown');
+  const d = await r.json();
+  renderDiagnostics(d.strategies || []);
+}
+
+function renderDiagnostics(strategies){
+  document.getElementById('diagLegend').innerHTML = Object.keys(DIAG_COLORS).map(key =>
+    `<div class="legend-item"><span class="legend-dot" style="background:${DIAG_COLORS[key]}"></span>${DIAG_LABELS[key]}</div>`
+  ).join('');
+
+  if (strategies.length === 0) {
+    document.getElementById('diagTable').innerHTML = '<tr><td>Пока нет ни одной оценки чекпоинта.</td></tr>';
+    return;
+  }
+
+  let html = '<tr><th>Стратегия</th><th>Всего</th><th>Открыто</th><th class="diag-bar-cell">Разбивка</th>' +
+             '<th class="diag-price-stats">Цены отклонённых (p50 / p75 / p90 / max)</th></tr>';
+  for (const s of strategies) {
+    const b = bucketDecisions(s.decisions);
+    const opened = b.opened;
+    let bar = '<div class="diag-stackbar">';
+    for (const key of ['opened', 'quiet', 'blocked_price', 'blocked_other']) {
+      const count = b[key];
+      if (count === 0) continue;
+      const pct = (count / s.total * 100).toFixed(1);
+      bar += `<div class="seg" style="width:${pct}%;background:${DIAG_COLORS[key]}" ` +
+             `title="${DIAG_LABELS[key]}: ${count} (${pct}%)"></div>`;
+    }
+    bar += '</div>';
+    const ps = s.rejected_price_stats;
+    const priceStats = ps
+      ? `${ps.p50.toFixed(3)} / ${ps.p75.toFixed(3)} / ${ps.p90.toFixed(3)} / ${ps.max.toFixed(3)} (n=${ps.n})`
+      : '—';
+    html += `<tr><td>${escapeHtml(s.display_name)}</td><td>${s.total}</td><td>${opened}</td>` +
+            `<td class="diag-bar-cell">${bar}</td><td class="diag-price-stats">${priceStats}</td></tr>`;
+  }
+  document.getElementById('diagTable').innerHTML = html;
+}
+
 // -- tiny inline-SVG charts (no charting library) ----------------------------------
 // Mark specs kept consistent across every chart below: hairline recessive
 // gridlines/axes (#2c2c2a), muted axis/label text (#898781), 2px round-cap
@@ -610,29 +712,50 @@ async function loadFeaturesCount(){
 // often too short for an inline label to fit), a native <title> per mark
 // as the hover layer (a real tooltip, just the browser's own rather than a
 // custom JS one).
+// Plots equity INDEXED to each series' own starting balance (idx=100 at
+// t0), not raw dollars — strategies here have different deposit_usd AND
+// different entry-window counts (a 3-window strategy's wallets sum to
+// $300 starting, a dynamic_timing strategy's one shared wallet starts at
+// $100), so a shared dollar axis let baseline size alone dominate the
+// chart (one pair of $300-summed strategies stretching the axis to
+// ~$319 while everyone else's real PnL swings sat invisible near the
+// bottom) — exactly the dataviz skill's "two measures of different
+// scale -> index to a common base (=100 at t0) on ONE axis" anti-pattern
+// fix, not a dual axis. `p.idx` is precomputed by the caller as
+// p.equity / series_initial_balance * 100; `p.equity` is kept on each
+// point only for the tooltip, never plotted.
 function svgLineChart(series, width, height){
   const pad = 34;
   let allPoints = series.flatMap(s => s.points);
   if (allPoints.length === 0) return '<svg viewBox="0 0 ' + width + ' ' + height + '"></svg>';
   const tMin = Math.min(...allPoints.map(p => p.t)), tMax = Math.max(...allPoints.map(p => p.t));
-  const eMin = Math.min(...allPoints.map(p => p.equity)), eMax = Math.max(...allPoints.map(p => p.equity));
-  const eSpan = (eMax - eMin) || 1, tSpan = (tMax - tMin) || 1;
+  // Baseline (100%) always inside the visible range, even if every
+  // series stayed flat or all moved the same direction — otherwise the
+  // one fixed reference point readers compare everything against could
+  // silently fall off the plotted band.
+  const idxMin = Math.min(100, ...allPoints.map(p => p.idx)), idxMax = Math.max(100, ...allPoints.map(p => p.idx));
+  const idxSpan = (idxMax - idxMin) || 1, tSpan = (tMax - tMin) || 1;
   const x = t => pad + (t - tMin) / tSpan * (width - 2 * pad);
-  const y = e => height - pad - (e - eMin) / eSpan * (height - 2 * pad);
+  const y = v => height - pad - (v - idxMin) / idxSpan * (height - 2 * pad);
 
   let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">`;
   svg += `<line x1="${pad}" y1="${height-pad}" x2="${width-pad}" y2="${height-pad}" stroke="#2c2c2a"/>`;
   svg += `<line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height-pad}" stroke="#2c2c2a"/>`;
-  svg += `<text x="4" y="${pad+4}" fill="#898781" font-size="10">$${eMax.toFixed(0)}</text>`;
-  svg += `<text x="4" y="${height-pad}" fill="#898781" font-size="10">$${eMin.toFixed(0)}</text>`;
+  svg += `<text x="4" y="${pad+4}" fill="#898781" font-size="10">${idxMax.toFixed(1)}%</text>`;
+  svg += `<text x="4" y="${height-pad}" fill="#898781" font-size="10">${idxMin.toFixed(1)}%</text>`;
+  // Baseline reference at 100% — solid hairline (never dashed, see the
+  // dataviz skill's anti-patterns), one shade brighter than the axes so
+  // it's readable as "start" without competing with the data lines.
+  svg += `<line x1="${pad}" y1="${y(100)}" x2="${width-pad}" y2="${y(100)}" stroke="#3a3d42"/>`;
+  svg += `<text x="${width-pad-2}" y="${y(100)-4}" fill="#898781" font-size="9" text-anchor="end">старт (100%)</text>`;
   series.forEach((s, i) => {
     if (s.points.length === 0) return;
-    const d = s.points.map(p => `${x(p.t)},${y(p.equity)}`).join(' ');
+    const d = s.points.map(p => `${x(p.t)},${y(p.idx)}`).join(' ');
     svg += `<polyline points="${d}" fill="none" stroke="${s.color}" stroke-width="2" ` +
            `stroke-linecap="round" stroke-linejoin="round"><title>${escapeHtml(s.name)}</title></polyline>`;
     const last = s.points[s.points.length - 1];
-    svg += `<circle cx="${x(last.t)}" cy="${y(last.equity)}" r="5" fill="${s.color}" stroke="#171a21" stroke-width="2">` +
-           `<title>${escapeHtml(s.name)}: $${last.equity.toFixed(2)}</title></circle>`;
+    svg += `<circle cx="${x(last.t)}" cy="${y(last.idx)}" r="5" fill="${s.color}" stroke="#171a21" stroke-width="2">` +
+           `<title>${escapeHtml(s.name)}: ${last.idx.toFixed(1)}% ($${last.equity.toFixed(2)})</title></circle>`;
   });
   svg += '</svg>';
   return svg;
@@ -720,7 +843,11 @@ function renderAnalytics(d){
   const byAbsPnl = [...d.strategy_summary].sort((a, b) => Math.abs(b.net_pnl) - Math.abs(a.net_pnl));
   const shown = byAbsPnl.slice(0, 8);
   const series = shown.map((s, i) => ({
-    name: s.display_name, color: PALETTE[i % PALETTE.length], points: s.equity_curve || [],
+    name: s.display_name, color: PALETTE[i % PALETTE.length],
+    // idx = % of this strategy's OWN starting balance — see svgLineChart's
+    // comment for why (different strategies start at different $ totals
+    // depending on how many entry-window wallets they sum).
+    points: (s.equity_curve || []).map(p => ({ ...p, idx: p.equity / (s.initial_balance || 100) * 100 })),
   }));
   document.getElementById('equityChart').innerHTML = svgLineChart(series, 760, 260);
   const legend = series.map(s =>
@@ -1251,6 +1378,18 @@ def build_app(cfg: AppConfig, engine: Engine) -> FastAPI:
     @app.get("/api/features/count")
     async def features_count(strategy: Optional[str] = None) -> JSONResponse:
         return JSONResponse({"count": engine.storage.count_checkpoint_features(strategy=strategy)})
+
+    @app.get("/api/diagnostics/decision_breakdown")
+    async def diagnostics_decision_breakdown() -> JSONResponse:
+        """Backs the Диагностика tab — the same per-strategy 'why is it
+        (not) trading' breakdown scripts/decision_breakdown.py prints
+        from a terminal, live in the dashboard instead. See that
+        script's docstring for what each decision value means."""
+        rows = engine.storage.get_decision_breakdown()
+        for row in rows:
+            row["display_name"] = display_names.get(row["strategy"], row["strategy"])
+            row["rejected_price_stats"] = engine.storage.get_rejected_fill_price_stats(row["strategy"])
+        return JSONResponse({"strategies": rows})
 
     @app.get("/api/activity")
     async def get_activity(since_id: int = 0, strategy: Optional[str] = None, limit: int = 300) -> JSONResponse:

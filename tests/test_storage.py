@@ -417,6 +417,61 @@ class CheckpointFeaturesTests(unittest.TestCase):
             storage.close()
 
 
+class DecisionBreakdownTests(unittest.TestCase):
+    """Covers get_decision_breakdown/get_rejected_fill_price_stats — backs
+    the dashboard's Диагностика tab (same data scripts/decision_breakdown.py
+    prints from a terminal, see that script's docstring)."""
+
+    def test_groups_counts_by_strategy_and_decision(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="1", strategy="a", decision="no_signal"))
+            storage.log_checkpoint_features(make_feature_row(id_="2", strategy="a", decision="no_signal"))
+            storage.log_checkpoint_features(make_feature_row(id_="3", strategy="a", decision="opened"))
+            storage.log_checkpoint_features(make_feature_row(id_="4", strategy="b", decision="rejected_max_coefficient"))
+
+            rows = {r["strategy"]: r for r in storage.get_decision_breakdown()}
+            self.assertEqual(rows["a"]["total"], 3)
+            self.assertEqual(rows["a"]["decisions"], {"no_signal": 2, "opened": 1})
+            self.assertEqual(rows["b"]["decisions"], {"rejected_max_coefficient": 1})
+            storage.close()
+
+    def test_busiest_strategy_first(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(id_="1", strategy="quiet"))
+            for i in range(3):
+                storage.log_checkpoint_features(make_feature_row(id_=f"b{i}", strategy="busy"))
+
+            names = [r["strategy"] for r in storage.get_decision_breakdown()]
+            self.assertEqual(names, ["busy", "quiet"])
+            storage.close()
+
+    def test_rejected_fill_price_stats_only_counts_that_decision_and_strategy(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            for i, price in enumerate([0.6, 0.7, 0.8]):
+                storage.log_checkpoint_features(make_feature_row(
+                    id_=f"r{i}", strategy="a", decision="rejected_max_coefficient", fill_price=price))
+            storage.log_checkpoint_features(make_feature_row(id_="o1", strategy="a", decision="opened", fill_price=0.5))
+            storage.log_checkpoint_features(make_feature_row(
+                id_="r_other", strategy="b", decision="rejected_max_coefficient", fill_price=0.99))
+
+            stats = storage.get_rejected_fill_price_stats("a")
+            self.assertEqual(stats["n"], 3)
+            self.assertAlmostEqual(stats["p50"], 0.7)
+            self.assertAlmostEqual(stats["max"], 0.8)
+            storage.close()
+
+    def test_rejected_fill_price_stats_none_below_min_n(self):
+        with TemporaryDirectory() as tmp:
+            storage = Storage(Path(tmp))
+            storage.log_checkpoint_features(make_feature_row(
+                id_="r1", strategy="a", decision="rejected_max_coefficient", fill_price=0.6))
+            self.assertIsNone(storage.get_rejected_fill_price_stats("a"))
+            storage.close()
+
+
 def make_closed_trade_with_features(
     storage: Storage, strategy: str = "a", won: bool = True, stake: float = 10.0,
     opened_ts: Optional[float] = None, link_features: bool = True, **feature_overrides,

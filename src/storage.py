@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import statistics
 import time
 from pathlib import Path
 from typing import Optional
@@ -320,6 +321,50 @@ class Storage:
         else:
             cur = self._conn.execute("SELECT COUNT(*) FROM checkpoint_features")
         return cur.fetchone()[0]
+
+    def get_decision_breakdown(self) -> list[dict]:
+        """Per-strategy `decision` counts, busiest strategy first — same
+        idea as scripts/decision_breakdown.py (see that script's own
+        docstring for what each decision value means), exposed here so
+        the dashboard's Диагностика tab can show it live instead of
+        needing SSH/sqlite3 access every time. Returns
+        [{"strategy": ..., "total": ..., "decisions": {decision: count}}],
+        one entry per strategy that has ANY logged evaluations."""
+        cur = self._conn.execute(
+            "SELECT strategy, decision, COUNT(*) FROM checkpoint_features GROUP BY strategy, decision"
+        )
+        by_strategy: dict[str, dict[str, int]] = {}
+        for strategy, decision, count in cur.fetchall():
+            by_strategy.setdefault(strategy, {})[decision or "(none)"] = count
+        out = [
+            {"strategy": strategy, "total": sum(decisions.values()), "decisions": decisions}
+            for strategy, decisions in by_strategy.items()
+        ]
+        out.sort(key=lambda row: -row["total"])
+        return out
+
+    def get_rejected_fill_price_stats(self, strategy: str, min_n: int = 3) -> Optional[dict]:
+        """Distribution (p50/p75/p90/max) of fill_price among this
+        strategy's rejected_max_coefficient rows — what a genuine signal
+        was priced at right before being thrown out purely for exceeding
+        max_coefficient. None below `min_n` samples (too little to read
+        anything into). See engine.py's _open_due_trades for where
+        fill_price gets logged on that decision specifically."""
+        cur = self._conn.execute(
+            "SELECT fill_price FROM checkpoint_features "
+            "WHERE strategy = ? AND decision = 'rejected_max_coefficient' AND fill_price IS NOT NULL",
+            (strategy,),
+        )
+        prices = sorted(row[0] for row in cur.fetchall())
+        if len(prices) < min_n:
+            return None
+        return {
+            "n": len(prices),
+            "p50": statistics.median(prices),
+            "p75": prices[int(len(prices) * 0.75)],
+            "p90": prices[min(int(len(prices) * 0.90), len(prices) - 1)],
+            "max": prices[-1],
+        }
 
     # -- reset -------------------------------------------------------------------
     def reset(self) -> None:
