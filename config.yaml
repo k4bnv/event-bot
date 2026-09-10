@@ -85,6 +85,13 @@ strategies:
     orderbook_depth_levels: 10
     imbalance_threshold: 1.8          # bid-volume / ask-volume ratio to trigger
 
+  # Name/wallet kept as "mean_reversion" for continuity, but the actual
+  # direction it bets flipped to CONTINUATION on 2026-09-10 — see
+  # src/strategies/mean_reversion.py's module docstring: the original
+  # revert-to-mean call went 0/23 in its first ~9h live, extreme enough
+  # to say the thesis was backwards for this pair/timeframe, not just
+  # under-tuned. Live experiment — revisit once enough trades have run
+  # on the flipped logic to judge it the same way.
   mean_reversion:
     enabled: true
     display_name: "C: Mean Reversion"

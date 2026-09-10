@@ -24,6 +24,7 @@ from src.strategies.fair_value_edge import (
 )
 from src.strategies.favorite_bias import FavoriteBiasStrategy
 from src.strategies.funding_skew import FundingSkewStrategy
+from src.strategies.mean_reversion import MeanReversionStrategy
 from src.strategies.prior_window_momentum import PriorWindowMomentumStrategy
 from src.strategies.volatility_breakout import VolatilityBreakoutStrategy
 
@@ -473,6 +474,46 @@ class VolatilityBreakoutStrategyTests(unittest.IsolatedAsyncioTestCase):
         history = make_points(prices, start_ts=now - 79, dt=1.0)
         ctx = make_ctx(history, remaining_sec=200)
         strategy = VolatilityBreakoutStrategy(config=self._config())
+        self.assertIsNone(await strategy.evaluate(ctx))
+
+
+class MeanReversionStrategyTests(unittest.IsolatedAsyncioTestCase):
+    """Direction flipped 2026-09-10 to bet CONTINUATION instead of
+    reversion — see the strategy's module docstring for why (0/23 live
+    on the original revert-to-mean call). These lock in the flipped
+    behavior so a future edit can't silently flip it back."""
+
+    def _config(self):
+        return {"lookback_sec": 60, "extreme_zscore": 1.5}
+
+    async def test_price_spike_up_bets_continuation_up(self):
+        now = 1000.0
+        calm = [100 + (0.01 if i % 2 == 0 else -0.01) for i in range(50)]
+        history = make_points(calm, start_ts=now - 59, dt=1.0)
+        history[-1] = PricePoint(ts=now, price=103.0)  # sharp outlier above the mean
+        ctx = make_ctx(history, remaining_sec=200)
+        strategy = MeanReversionStrategy(config=self._config())
+        signal = await strategy.evaluate(ctx)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)  # continuation, not reversion
+
+    async def test_price_spike_down_bets_continuation_down(self):
+        now = 1000.0
+        calm = [100 + (0.01 if i % 2 == 0 else -0.01) for i in range(50)]
+        history = make_points(calm, start_ts=now - 59, dt=1.0)
+        history[-1] = PricePoint(ts=now, price=97.0)  # sharp outlier below the mean
+        ctx = make_ctx(history, remaining_sec=200)
+        strategy = MeanReversionStrategy(config=self._config())
+        signal = await strategy.evaluate(ctx)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)  # continuation, not reversion
+
+    async def test_no_signal_when_calm(self):
+        now = 1000.0
+        prices = [100 + (0.01 if i % 2 == 0 else -0.01) for i in range(60)]
+        history = make_points(prices, start_ts=now - 59, dt=1.0)
+        ctx = make_ctx(history, remaining_sec=200)
+        strategy = MeanReversionStrategy(config=self._config())
         self.assertIsNone(await strategy.evaluate(ctx))
 
 
