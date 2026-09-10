@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import sqlite3
+import statistics
 import sys
 from collections import defaultdict
 
@@ -60,6 +61,25 @@ def load_counts(db_path: str, strategy: str | None = None) -> dict[str, dict[str
         conn.close()
 
 
+def load_rejected_fill_prices(db_path: str, strategy: str) -> list[float]:
+    """fill_price for every rejected_max_coefficient row — the price a
+    genuine signal was found at, but discarded purely because it was
+    above s_cfg.max_coefficient (engine.py logs fill_price on this
+    decision specifically, see _open_due_trades). Lets max_coefficient
+    be recalibrated against what the strategy ACTUALLY tried to pay,
+    instead of picking a new number blind."""
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute(
+            "SELECT fill_price FROM checkpoint_features "
+            "WHERE strategy = ? AND decision = 'rejected_max_coefficient' AND fill_price IS NOT NULL",
+            (strategy,),
+        )
+        return [row[0] for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
 def main(db_path: str, strategy: str | None = None) -> None:
     counts = load_counts(db_path, strategy)
     if not counts:
@@ -74,6 +94,22 @@ def main(db_path: str, strategy: str | None = None) -> None:
         for decision, count in sorted(by_decision.items(), key=lambda kv: -kv[1]):
             pct = count / total * 100
             print(f"    {decision:32s} {count:6d}  {pct:5.1f}%")
+
+        # A big rejected_max_coefficient bucket means real signals are
+        # being thrown away purely on price — show what those prices
+        # actually were, so a new max_coefficient can be set against
+        # real data instead of guessed.
+        if by_decision.get("rejected_max_coefficient", 0) >= 3:
+            prices = load_rejected_fill_prices(db_path, strat)
+            if prices:
+                prices.sort()
+                p50 = statistics.median(prices)
+                p75 = prices[int(len(prices) * 0.75)]
+                p90 = prices[min(int(len(prices) * 0.90), len(prices) - 1)]
+                print(
+                    f"    -> rejected fill_price distribution: n={len(prices)}  "
+                    f"p50={p50:.3f}  p75={p75:.3f}  p90={p90:.3f}  max={max(prices):.3f}"
+                )
 
 
 if __name__ == "__main__":
