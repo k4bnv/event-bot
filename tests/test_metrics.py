@@ -49,6 +49,27 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(lb.best_pnl.strategy, "good")
         self.assertEqual(lb.best_winrate.strategy, "good")
 
+    def test_single_qualified_combo_does_not_trivially_win_over_a_better_small_sample(self):
+        # Live bug: a strategy that happened to be the ONLY one past
+        # min_sample_size topped best_pnl/best_winrate/best_value even
+        # though it had a losing PnL and a 20% winrate, simply because
+        # max() over a one-element "qualified" list has nothing to lose
+        # to — meanwhile combos with real positive PnL sat one trade
+        # below the threshold and were invisible to the comparison.
+        only_qualified = VirtualWallet(strategy="barely_qualifies", initial_balance=100.0)
+        for _ in range(4):
+            add_trade(only_qualified, 2, price=0.5, won=False)
+        add_trade(only_qualified, 2, price=0.5, won=True)  # 1W/4L, net negative
+
+        actually_good = VirtualWallet(strategy="actually_good", initial_balance=100.0)
+        for _ in range(3):
+            add_trade(actually_good, 2, price=0.3, won=True)  # below min_sample_size, but net positive
+
+        stats = build_combo_stats({"barely_qualifies": only_qualified, "actually_good": actually_good})
+        lb = build_leaderboard(stats, min_sample_size=5)
+        self.assertEqual(lb.best_pnl.strategy, "actually_good")
+        self.assertEqual(lb.best_winrate.strategy, "actually_good")
+
     def test_falls_back_below_min_sample_size(self):
         w = VirtualWallet(strategy="tiny", initial_balance=100.0)
         add_trade(w, 12, price=0.5, won=True)

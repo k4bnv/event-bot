@@ -69,7 +69,17 @@ class Leaderboard:
 
 def build_leaderboard(combo_stats: dict[tuple[str, int], ComboStats], min_sample_size: int = 5) -> Leaderboard:
     qualified = [c for c in combo_stats.values() if c.trades >= min_sample_size]
-    pool = qualified or list(combo_stats.values())  # fall back if nothing has enough samples yet
+    # Need at least 2 qualified combos for "qualified" to mean anything — with
+    # exactly one, max() over a single-element list trivially returns it for
+    # ALL THREE categories regardless of whether it's actually good, which
+    # reads as "this strategy won" when really it's just the only one that's
+    # traded enough yet (seen live: a strategy with 20% winrate and negative
+    # PnL topped every leaderboard row simply because it was the sole combo
+    # past min_sample_size, while combos with real positive PnL sat just
+    # below the threshold and were invisible to the comparison). Falling
+    # back to the full pool in that case at least compares against
+    # everything that's traded so far, not a field of one.
+    pool = qualified if len(qualified) >= 2 else list(combo_stats.values())
 
     best_pnl = max(pool, key=lambda c: c.net_pnl, default=None)
     best_winrate = max(pool, key=lambda c: (c.winrate_pct, c.trades), default=None)
