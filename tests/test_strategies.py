@@ -652,24 +652,15 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(second)  # different series -> NOT blocked by the other's cooldown
         self.assertEqual(fake.calls, 2)
 
-    async def test_cooldown_is_independent_per_checkpoint(self):
-        # Same series, two different checkpoints (e.g. entry_windows_min:
-        # [4, 2]) firing minutes apart — neither should block the other,
-        # even well inside a long min_seconds_between_calls.
-        fake = FakeChatClient([
-            '{"direction": "UP", "confidence": 0.6, "reason": "4min-out"}',
-            '{"direction": "UP", "confidence": 0.6, "reason": "2min-out"}',
-        ])
-        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 9999}, client=fake)
-        market = self.LIVE_MARKET()
-
-        first = await strategy.evaluate(make_ctx([], market=market, window_min=4))
-        second = await strategy.evaluate(make_ctx([], market=market, window_min=2))
-        self.assertIsNotNone(first)
-        self.assertIsNotNone(second)  # different checkpoint on the same series -> not blocked
-        self.assertEqual(fake.calls, 2)
-
-    async def test_cooldown_still_blocks_the_exact_same_series_and_checkpoint(self):
+    async def test_cooldown_now_blocks_across_different_checkpoints_of_the_same_series(self):
+        # Changed 2026-09-10 when this strategy became dynamic_timing
+        # (dense scanning grid, like J/K — see ai_prompt.py's module
+        # docstring): the cooldown key dropped window_min and is now just
+        # the series_id, specifically so repeated checkpoints of the SAME
+        # still-open market collapse onto one cooldown timer instead of
+        # each getting its own independent shot — otherwise a market that
+        # never signals could burn through most of max_calls_per_day on
+        # its own before ever closing.
         fake = FakeChatClient([
             '{"direction": "UP", "confidence": 0.6, "reason": "a"}',
             '{"direction": "UP", "confidence": 0.6, "reason": "b"}',
@@ -677,11 +668,26 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
         strategy = AIPromptStrategy(config={"min_seconds_between_calls": 9999}, client=fake)
         market = self.LIVE_MARKET()
 
-        first = await strategy.evaluate(make_ctx([], market=market, window_min=2))
+        first = await strategy.evaluate(make_ctx([], market=market, window_min=4))
         second = await strategy.evaluate(make_ctx([], market=market, window_min=2))
         self.assertIsNotNone(first)
-        self.assertIsNone(second)  # same series AND same checkpoint -> still cooled down
+        self.assertIsNone(second)  # same series, different checkpoint -> still cooled down now
         self.assertEqual(fake.calls, 1)
+
+    async def test_already_open_this_market_suppresses_a_call_it_would_otherwise_make(self):
+        """Checked FIRST, before the cooldown/budget bookkeeping (see
+        evaluate()) — once a trade's opened in a market, every later
+        checkpoint of that SAME market must cost nothing, not just skip
+        trading. Same already_open_this_market mechanism adaptive_timing/
+        absorption_reversal use for their own dense scanning grids."""
+        fake = FakeChatClient(['{"direction": "UP", "confidence": 0.6, "reason": "a"}'])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
+
+        signal = await strategy.evaluate(
+            make_ctx([], market=self.LIVE_MARKET(), already_open_this_market=True)
+        )
+        self.assertIsNone(signal)
+        self.assertEqual(fake.calls, 0)  # never even reached the client
 
     async def test_daily_call_cap_blocks_further_calls(self):
         fake = FakeChatClient([

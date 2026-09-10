@@ -188,29 +188,30 @@ strategies:
   # without an API key set, it just logs one warning and skips every
   # checkpoint — never crashes, never silently charges you.
   # Cost knobs tuned for a small prepaid balance (e.g. a few dollars):
-  # entry_windows_min (1 checkpoint) x min_seconds_between_calls x
-  # max_calls_per_day together cap this at <=100 calls/day; with
-  # gemini-3.1-flash-lite's ~$0.25/M in + $1.50/M out and this prompt's size
-  # (~120 input + <=160 output tokens/call), that's still well under
-  # $0.02/day — a $3 balance covers many months at these settings. Loosen
-  # entry_windows_min/min_seconds_between_calls/max_calls_per_day once
-  # you've watched a day of data/bot.log and are comfortable with the spend.
+  # regardless of how many checkpoints entry_windows_min scans per market
+  # now (dynamic_timing — see below), max_calls_per_day is the actual,
+  # hard cap on calls/day; with gemini-3.1-flash-lite's ~$0.25/M in +
+  # $1.50/M out and this prompt's size (~120 input + <=160 output
+  # tokens/call), 100 calls/day is still well under $0.02/day — a $3
+  # balance covers many months at these settings. Raise
+  # min_seconds_between_calls/max_calls_per_day once you've watched a day
+  # of data/bot.log and are comfortable with the spend.
+  # Was two fixed checkpoints ([4, 2]) until 2026-09-10 — first live
+  # stretch on "2" came back 0 wins out of 18, and rather than keep
+  # guessing which minute-to-expiry suits an LLM verdict best, it now
+  # scans a dense grid like J/K and picks its own moment per market
+  # (dynamic_timing: true — see ai_prompt.py's module docstring for the
+  # "Converted to dynamic_timing" note, including the two cost-safety
+  # changes that came with it: already_open_this_market checked first,
+  # and the per-call cooldown now keyed by series_id alone instead of
+  # per-checkpoint). max_calls_per_day is still the real, hard spend
+  # ceiling regardless of how many checkpoints are configured here.
   ai_prompt:
     enabled: true
     display_name: "G: AI Prompt"
     deposit_usd: 100
-    # Two checkpoints: "2" (original — closest to expiry, highest
-    # confidence but the contract is often already extreme/thin by then,
-    # so a real edge computed against the quoted price frequently gets
-    # rejected once the honest fill price is checked — seen live) and
-    # "4" (earlier, both series still have it: 4<5 on 5MIN too), where
-    # the contract is usually closer to 0.5 and less likely to blow past
-    # max_coefficient. Cooldown is now keyed per (series, checkpoint) —
-    # see ai_prompt.py's __init__ docstring — so these two, and both
-    # series, each get an independent chance to fire rather than one
-    # shared timer starving the rest. max_calls_per_day below is what
-    # actually caps spend now.
-    entry_windows_min: [4, 2]
+    dynamic_timing: true
+    entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
     max_coefficient: 0.6
     stake_fraction: 0.01
     # provider: requesty (router.requesty.ai, one key -> 600+ models, "provider/model"
@@ -229,7 +230,12 @@ strategies:
     model: "google/gemini-3.1-flash-lite"
     lookback_sec: 180
     price_sample_count: 8              # fewer price samples in the prompt = fewer input tokens
-    min_seconds_between_calls: 300      # cooldown across ALL checkpoints/series, not just one
+    # Was 300 (5 min) — with a single shared-per-series cooldown now (see
+    # above), 300s would leave a 5-minute series only one real chance per
+    # market, defeating the point of scanning. Lowered so a still-open
+    # 5-min market can genuinely be re-checked a few times before expiry;
+    # max_calls_per_day is what actually bounds worst-case spend, not this.
+    min_seconds_between_calls: 90       # cooldown per series (not per checkpoint — see ai_prompt.py)
     max_calls_per_day: 100              # hard ceiling regardless of cooldown math above — the real safety net
     max_tokens: 160                     # was 80 — verified against a live call: the model's own
                                          # JSON (base_prob/adjustment/prob_up/reason) plus a

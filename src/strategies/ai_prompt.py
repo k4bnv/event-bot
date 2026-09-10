@@ -26,6 +26,30 @@ Disabled by default in config.yaml: it costs money per call and needs an
 API key. Every failure mode (missing key, network error, timeout,
 malformed JSON) degrades to "no signal" — this strategy must never crash
 the engine just because an LLM had a bad day.
+
+Converted to dynamic_timing (free-scanning, like J/K) 2026-09-10, at the
+user's request, after G-2м's first live stretch came back 0 wins out of
+18 — no obvious bug found in the edge-direction code (the prob_up/edge
+math already had its own documented fix, see _signal_from_prob_up), so
+rather than keep guessing which of a couple of fixed checkpoints (was
+[4, 2]) suits an LLM verdict best, it now scans a dense grid and picks
+its own moment per market, same as J/K already do (see
+adaptive_timing.py/absorption_reversal.py's own module docstrings for
+that mechanism — ctx.already_open_this_market, one shared wallet). Two
+knock-on changes this needed, both about keeping API spend sane once a
+market gets evaluated at up to 10 checkpoints instead of 2:
+  1. `already_open_this_market` is now checked FIRST, before even the
+     cooldown/budget bookkeeping — once a trade's opened in a market,
+     every later checkpoint of that SAME market must cost nothing, not
+     just skip trading.
+  2. The per-call cooldown (`min_seconds_between_calls`) used to be
+     keyed per (series, checkpoint) specifically so two fixed checkpoints
+     minutes apart wouldn't starve each other (see __init__). With a
+     dense scanning grid that reasoning flips: many checkpoints of the
+     SAME still-open market firing within the same short cooldown window
+     is exactly the case to collapse together, or a slow LLM day could
+     burn most of max_calls_per_day on markets that were never going to
+     signal. Keyed by series_id alone now.
 """
 from __future__ import annotations
 
@@ -172,22 +196,20 @@ class AIPromptStrategy(BaseStrategy):
 
     def __init__(self, config: dict, client: Optional["ChatClient"] = None):
         super().__init__(config)
-        # Keyed by "series_id:window_min", NOT a single shared timestamp —
-        # a single float cooldown meant one series/checkpoint firing could
-        # silently eat the whole strategy's budget and block every OTHER
-        # series/checkpoint for min_seconds_between_calls, even though
-        # EntryWindowManager already guarantees each one is only ever due
-        # once per window on its own. Concretely: with entry_windows_min
-        # covering more than one checkpoint (e.g. [4, 2]) and two series
-        # (5MIN/15MIN) both configured, a shared cooldown meant whichever
-        # fired first could starve the rest for 5 minutes — on a 5-minute
-        # window, the "2" checkpoint would then NEVER get a real chance,
-        # since it's due only ~2 minutes after "4". Keying per (series,
-        # checkpoint) lets every configured slot actually get evaluated
-        # every time it's due; max_calls_per_day remains the real, only
-        # cost ceiling (see below) — this cooldown is now just a per-slot
-        # safety net, effectively redundant with EntryWindowManager's own
-        # once-per-window dedup rather than a meaningful spend throttle.
+        # Keyed by series_id alone, NOT a single shared timestamp and NOT
+        # per-checkpoint either (see the module docstring's "Converted to
+        # dynamic_timing" note for why that changed) — a single float
+        # cooldown would let one series' market silently eat the whole
+        # strategy's budget and block every OTHER series for
+        # min_seconds_between_calls, so different series still need
+        # independent keys. But within ONE series, this now scans a dense
+        # checkpoint grid per market (entry_windows_min), and collapsing
+        # all of a still-open market's repeated "still no edge" calls onto
+        # one cooldown timer is exactly the point: max_calls_per_day is
+        # the real, hard cost ceiling regardless (see below), but this
+        # cooldown is what keeps one slow-to-signal market from burning
+        # through most of it before ctx.already_open_this_market even gets
+        # a chance to stop the calls for good.
         self._last_call_ts: dict[str, float] = {}
         self._warned_no_key = False
         self._warned_budget = False
@@ -204,6 +226,9 @@ class AIPromptStrategy(BaseStrategy):
             await self._client.close()
 
     async def evaluate(self, ctx: StrategyContext) -> Optional[Signal]:
+        if ctx.already_open_this_market:
+            return None  # already committed to this market at an earlier checkpoint — costs nothing to check first
+
         if self._client is None:
             if not self._warned_no_key:
                 provider = str(self.config.get("provider", "requesty"))
@@ -220,7 +245,7 @@ class AIPromptStrategy(BaseStrategy):
 
         min_gap = float(self.config.get("min_seconds_between_calls", 300))
         now = time.time()
-        cooldown_key = f"{ctx.market.series_id}:{ctx.window_min}"
+        cooldown_key = ctx.market.series_id
         if now - self._last_call_ts.get(cooldown_key, 0.0) < min_gap:
             return None
 
