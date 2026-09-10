@@ -31,7 +31,7 @@ from src.engine import Engine
 from src.logger import setup_logging
 from src.market_data import OkxMarketDataProvider
 from src.mock_market import MockMarketDataProvider
-from src.models import EventMarket, OrderBookLevel, PricePoint, simulate_market_fill
+from src.models import EventMarket, OrderBookLevel, PricePoint, simulate_market_fill, simulate_market_sell
 from src.okx_client import OKXClient, OKXClientConfig
 from src.storage import Storage
 from src.strategies.ai_prompt import AIPromptStrategy, build_client_config
@@ -182,6 +182,35 @@ async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stak
         except (TypeError, ValueError, IndexError):
             pass
 
+    # ROUND TRIP: buy UP walking the asks (above), then immediately sell
+    # those same contracts back into the bids. This is the number that
+    # decides whether an early-exit ("take profit before expiry")
+    # strategy is viable at all: the position has to move MORE in your
+    # favour than this just to break even on the spread, because entry
+    # and exit each pay it once. OKX does allow selling shares back on
+    # the order book before expiry (their own docs say so, and the
+    # proceeds are net of fees), so the exchange isn't the constraint
+    # here — the book's own thinness is.
+    roundtrip_cost_pct = None
+    print("  round trip (buy UP now, sell it straight back into the bids):")
+    if up_vwap is None or up_contracts <= 0:
+        print("    <no entry fill to exit from>")
+    elif not bids:
+        print("    <no bid liquidity at all — nothing to exit into>")
+    else:
+        exit_vwap, sold, received, exit_full = simulate_market_sell(bids, up_contracts)
+        if exit_vwap is None:
+            print("    <no usable bid levels>")
+        else:
+            roundtrip_cost_pct = ((up_spent - received) / up_spent * 100) if up_spent > 0 else None
+            print(f"    exit vwap={exit_vwap:.4f}  sold={sold:.2f}/{up_contracts:.2f} contracts  "
+                  f"received=${received:.2f}  {'(fully filled)' if exit_full else '(BIDS RAN OUT — worse in reality)'}")
+            if roundtrip_cost_pct is not None:
+                print(f"    >>> round-trip cost: {roundtrip_cost_pct:+.1f}% of stake "
+                      f"(${up_spent:.2f} in -> ${received:.2f} out). An early-exit strategy needs the "
+                      f"contract to move MORE than this in its favour before taking profit is even "
+                      f"break-even; fees come on top.")
+
     # DOWN: bids are OTHER traders' resting buy-UP orders, not a depth of
     # offers to sell you DOWN — walking multiple levels like we do for UP
     # is not a faithful simulation (OKX doesn't publicly document how a
@@ -219,6 +248,7 @@ async def _measure_series_liquidity(client: OKXClient, series_id: str, test_stak
         "up_vwap": up_vwap, "up_slippage_pct": up_slippage_pct,
         "up_book_ran_out": (not up_full) if up_vwap is not None else None,
         "down_top_estimate": down_top_estimate, "down_diff_pct": down_diff_pct,
+        "roundtrip_cost_pct": roundtrip_cost_pct,
     }
 
 
@@ -241,6 +271,16 @@ def _print_liquidity_summary(rows: list[dict]) -> None:
                   f"mean={sum(slips) / len(slips):+.1f}  max={slips[-1]:+.1f}")
         else:
             print("  UP slippage %: no usable samples")
+
+        # The early-exit viability number — see _measure_series_liquidity's
+        # round-trip block. Reported per series because book thinness is a
+        # per-instrument property, not a market-wide one.
+        trips = sorted(r["roundtrip_cost_pct"] for r in group if r.get("roundtrip_cost_pct") is not None)
+        if trips:
+            print(f"  round-trip cost %:  min={trips[0]:+.1f}  median={trips[len(trips) // 2]:+.1f}  "
+                  f"mean={sum(trips) / len(trips):+.1f}  max={trips[-1]:+.1f}")
+        else:
+            print("  round-trip cost %: no usable samples")
         if spreads:
             print(f"  top-of-book spread %:  min={min(spreads):.1f}  "
                   f"mean={sum(spreads) / len(spreads):.1f}  max={max(spreads):.1f}")
@@ -260,6 +300,7 @@ def _save_liquidity_csv(cfg, rows: list[dict]) -> Optional[Path]:
     fieldnames = [
         "ts", "series_id", "inst_id", "remaining_sec", "last", "spread_pct",
         "up_vwap", "up_slippage_pct", "up_book_ran_out", "down_top_estimate", "down_diff_pct",
+        "roundtrip_cost_pct",
     ]
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

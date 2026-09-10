@@ -4,7 +4,67 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.models import Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, simulate_market_fill
+from src.models import (
+    Direction, EventMarket, OrderBookLevel, OrderBookSnapshot, simulate_market_fill, simulate_market_sell,
+)
+
+
+class SimulateMarketSellTests(unittest.TestCase):
+    """The EXIT side — what an early-exit strategy would actually receive
+    selling a position back into the bids. Deliberately size-limited (N
+    contracts) rather than budget-limited like simulate_market_fill; see
+    that asymmetry note in simulate_market_sell's docstring."""
+
+    def test_single_level_absorbs_the_whole_position(self):
+        bids = [OrderBookLevel(price=0.6, size=100.0)]
+        vwap, sold, received, full = simulate_market_sell(bids, 40.0)
+        self.assertEqual(vwap, 0.6)
+        self.assertAlmostEqual(sold, 40.0)
+        self.assertAlmostEqual(received, 24.0)
+        self.assertTrue(full)
+
+    def test_walks_into_a_worse_level_and_averages_down(self):
+        # 10 contracts clear at 0.6, the remaining 30 only at 0.4
+        bids = [OrderBookLevel(price=0.6, size=10.0), OrderBookLevel(price=0.4, size=100.0)]
+        vwap, sold, received, full = simulate_market_sell(bids, 40.0)
+        self.assertTrue(full)
+        self.assertAlmostEqual(sold, 40.0)
+        self.assertAlmostEqual(received, 10 * 0.6 + 30 * 0.4)
+        self.assertAlmostEqual(vwap, (10 * 0.6 + 30 * 0.4) / 40.0)
+        self.assertLess(vwap, 0.6)  # exiting a thin book is worse than top-of-book
+
+    def test_thin_bids_report_not_fully_filled(self):
+        bids = [OrderBookLevel(price=0.6, size=5.0)]  # can only absorb 5 of 40
+        vwap, sold, received, full = simulate_market_sell(bids, 40.0)
+        self.assertFalse(full)
+        self.assertAlmostEqual(sold, 5.0)
+        self.assertAlmostEqual(received, 3.0)
+
+    def test_no_bids_at_all_returns_none(self):
+        vwap, sold, received, full = simulate_market_sell([], 40.0)
+        self.assertIsNone(vwap)
+        self.assertEqual(sold, 0.0)
+        self.assertEqual(received, 0.0)
+        self.assertFalse(full)
+
+    def test_zero_and_negative_price_levels_are_skipped(self):
+        bids = [OrderBookLevel(price=0.0, size=10.0), OrderBookLevel(price=0.5, size=10.0)]
+        vwap, sold, received, full = simulate_market_sell(bids, 10.0)
+        self.assertAlmostEqual(vwap, 0.5)
+        self.assertAlmostEqual(received, 5.0)
+        self.assertTrue(full)
+
+    def test_round_trip_on_a_thin_book_loses_money_immediately(self):
+        # The whole point of measuring this: buy $20 walking the asks, sell
+        # straight back into the bids, and see what's left. On a spread this
+        # wide an early-exit strategy is dead on arrival.
+        asks = [OrderBookLevel(price=0.60, size=100.0)]
+        bids = [OrderBookLevel(price=0.40, size=100.0)]
+        _, contracts, spent, _ = simulate_market_fill(asks, 20.0)
+        _, _, received, _ = simulate_market_sell(bids, contracts)
+        roundtrip_cost_pct = (spent - received) / spent * 100
+        self.assertAlmostEqual(received, 20.0 * (0.40 / 0.60))
+        self.assertGreater(roundtrip_cost_pct, 30.0)
 
 
 class SimulateMarketFillTests(unittest.TestCase):

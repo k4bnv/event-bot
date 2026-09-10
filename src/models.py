@@ -109,6 +109,46 @@ def simulate_market_fill(levels: list[OrderBookLevel], budget_usd: float) -> tup
     return vwap, contracts, spent, fully_filled
 
 
+def simulate_market_sell(levels: list[OrderBookLevel], contracts: float) -> tuple[Optional[float], float, float, bool]:
+    """Mirror of `simulate_market_fill` for the EXIT side: walk bid levels
+    (BEST PRICE FIRST, same order OKX returns) simulating a market SELL of
+    `contracts` contracts. Each contract sold at a level yields `price`
+    USDT, so a level of `size` contracts absorbs at most `price * size`.
+
+    Returns (vwap_price, contracts_sold, usd_received, fully_filled).
+    fully_filled=False means the visible bids couldn't absorb the whole
+    position — the rest would walk deeper still, i.e. a real exit is only
+    ever worse than what's computed here.
+
+    The asymmetry with simulate_market_fill is deliberate and not
+    cosmetic: a BUY is budget-limited (spend up to $X, receive however
+    many contracts that buys), while a SELL is size-limited (you hold
+    exactly N contracts and want the proceeds). Passing a dollar budget
+    here instead would silently answer a different question.
+
+    Why this matters for an early-exit strategy: entry already pays the
+    spread on these thin books (see simulate_market_fill's docstring —
+    40-1000%+ away from the naive price on live data), and exiting before
+    expiry pays it a SECOND time. This function is what makes that
+    round-trip cost measurable instead of assumed — see run.py's
+    --check-liquidity, which prints both halves.
+    """
+    sold, received = 0.0, 0.0
+    for level in levels:
+        price, size = level.price, level.size
+        if price <= 0 or size <= 0:
+            continue
+        remaining = contracts - sold
+        if remaining <= 0:
+            break
+        take = size if size <= remaining else remaining
+        sold += take
+        received += take * price
+    fully_filled = sold >= contracts - 1e-6
+    vwap = (received / sold) if sold > 0 else None
+    return vwap, sold, received, fully_filled
+
+
 @dataclass
 class EventMarket:
     """One rolling BTC event-contract window, matching OKX's real EVENTS
