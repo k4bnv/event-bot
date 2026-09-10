@@ -711,6 +711,67 @@ class AIPromptStrategyTests(unittest.IsolatedAsyncioTestCase):
         prompt = strategy._build_prompt(make_ctx([], market=market))
         self.assertEqual(prompt, "hello MY-SERIES world")
 
+    def test_confluence_placeholders_describe_the_barrier_margin(self):
+        # $strike_distance_pct/$side_now back CONFLUENCE_PROMPT_TEMPLATE's
+        # "safety margin in plain terms" framing (see that constant's
+        # comment) — the deliberate alternative to handing the model a
+        # normal-CDF number to fudge.
+        strategy = AIPromptStrategy(
+            config={"prompt_template": "d=${strike_distance_pct} side=$side_now need=$min_agree", "min_agree": 3},
+            client=FakeChatClient([]),
+        )
+        market = make_market(up_price=0.4, floor_strike=100.0)
+        ctx = make_ctx([PricePoint(ts=0, price=100.5)] * 12, market=market)
+        self.assertEqual(strategy._build_prompt(ctx), "d=+0.500 side=UP need=3")
+
+        below = make_ctx([PricePoint(ts=0, price=99.5)] * 12, market=market)
+        self.assertEqual(strategy._build_prompt(below), "d=-0.500 side=DOWN need=3")
+
+    def test_confluence_placeholders_are_na_without_a_strike(self):
+        strategy = AIPromptStrategy(
+            config={"prompt_template": "d=${strike_distance_pct} side=$side_now"}, client=FakeChatClient([]),
+        )
+        ctx = make_ctx([PricePoint(ts=0, price=100.0)] * 12, market=make_market(up_price=0.4, floor_strike=None))
+        self.assertEqual(strategy._build_prompt(ctx), "d=n/a side=n/a")
+
+    async def test_min_confidence_drops_a_hedged_call(self):
+        fake = FakeChatClient([
+            '{"direction": "UP", "agree": 4, "confidence": 0.55, "reason": "meh"}',
+            '{"direction": "UP", "agree": 4, "confidence": 0.80, "reason": "clean"}',
+        ])
+        strategy = AIPromptStrategy(
+            config={"min_seconds_between_calls": 0, "min_confidence": 0.7}, client=fake,
+        )
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
+        signal = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.UP)
+
+    async def test_min_agree_drops_a_thin_confluence(self):
+        fake = FakeChatClient([
+            '{"direction": "DOWN", "agree": 2, "confidence": 0.9, "reason": "half"}',
+            '{"direction": "DOWN", "agree": 3, "confidence": 0.9, "reason": "enough"}',
+        ])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_agree": 3}, client=fake)
+        self.assertIsNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
+        signal = await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET()))
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal.direction, Direction.DOWN)
+
+    async def test_min_agree_does_not_block_a_schema_without_that_field(self):
+        # A response carrying no "agree" at all (e.g. DEFAULT_PROMPT_TEMPLATE's
+        # schema) must not be silently blocked by a gate meant for the
+        # confluence template — see _signal_from_direction's docstring.
+        fake = FakeChatClient(['{"direction": "UP", "confidence": 0.9, "reason": "other schema"}'])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0, "min_agree": 3}, client=fake)
+        self.assertIsNotNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
+
+    async def test_gates_are_off_by_default(self):
+        # Unconfigured => the plain default template behaves exactly as before.
+        fake = FakeChatClient(['{"direction": "UP", "agree": 1, "confidence": 0.3, "reason": "weak"}'])
+        strategy = AIPromptStrategy(config={"min_seconds_between_calls": 0}, client=fake)
+        self.assertIsNotNone(await strategy.evaluate(make_ctx([], market=self.LIVE_MARKET())))
+
     def test_prompt_template_typo_does_not_raise(self):
         strategy = AIPromptStrategy(
             config={"prompt_template": "value=$totally_unknown_placeholder!"}, client=FakeChatClient([]),

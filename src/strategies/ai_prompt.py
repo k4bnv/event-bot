@@ -50,6 +50,19 @@ market gets evaluated at up to 10 checkpoints instead of 2:
      is exactly the case to collapse together, or a slow LLM day could
      burn most of max_calls_per_day on markets that were never going to
      signal. Keyed by series_id alone now.
+
+The PROMPT itself was then replaced the same day (config.yaml's
+prompt_template now holds CONFLUENCE_PROMPT_TEMPLATE — see that
+constant's comment below for the full design): the barrier template it
+replaced asked the model to nudge a statistical probability this bot
+already computes in code, which is the weakest thing an LLM can be
+asked to do here. The new one asks whether the setup is unambiguous at
+all, defaults to NONE, and has to report how many independent factors
+agree — with `min_agree`/`min_confidence` enforced in
+_signal_from_direction rather than merely requested in prose. Aimed at
+winrate through selectivity; max_coefficient is what turns that winrate
+into profit (break-even winrate = price paid), so it must stay below
+whatever winrate this actually delivers.
 """
 from __future__ import annotations
 
@@ -98,6 +111,11 @@ logger = logging.getLogger("okx_event_bot.strategies.ai_prompt")
 #   not enough history). $max_adjustment (the config.yaml max_adjustment
 #   value, formatted — see BARRIER_PROMPT_TEMPLATE and
 #   _signal_from_prob_up for why this is enforced in code, not just text).
+#   $strike_distance_pct (signed % of spot vs the barrier — positive means
+#   spot is above it) $side_now ("UP"/"DOWN" — whichever side that puts
+#   ahead right now) $min_agree (the config.yaml min_agree value — same
+#   enforced-in-code-not-just-text deal as $max_adjustment, see
+#   _signal_from_direction). All three are for CONFLUENCE_PROMPT_TEMPLATE.
 DEFAULT_PROMPT_TEMPLATE = (
     "BTC event contract, decide UP/DOWN/NONE before expiry.\n"
     "series=$series method=$method strike=$strike remaining=${remaining}s market_px_up=$market_px\n"
@@ -136,6 +154,65 @@ BARRIER_PROMPT_TEMPLATE = (
     "\n"
     '{"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,\n'
     '"reason":"<=6 слов"}'
+)
+
+# The active template for this deployment (config.yaml's prompt_template)
+# — deliberately NOT a reworded barrier prompt. BARRIER_PROMPT_TEMPLATE
+# above asks the model to nudge a statistical probability, which is the
+# weakest possible use of an LLM: the statistics are already computed in
+# code, better and for free, so the model's only contribution is noise
+# on top of a number this bot already has. It went 0 wins out of 18 live
+# on the "2 мин" checkpoint before the strategy was even converted to
+# scanning.
+#
+# This one asks a genuinely different question: not "what's the
+# probability" but "is this setup unambiguous enough to touch at all".
+# Three deliberate design choices, all aimed at WINRATE rather than
+# volume:
+#
+#   1. Abstention-first. NONE is stated as the default answer, and the
+#      model is told that a wrong call costs more than silence. Every
+#      other strategy in this bot is a threshold rule that fires
+#      whenever its one indicator crosses; this is the only one whose
+#      job is mostly to say no.
+#   2. Confluence, not a single indicator. The model must count how many
+#      INDEPENDENT factors (safety margin to the barrier, 5-min drift,
+#      1-min impulse, book/funding) actually agree, and report that
+#      count — which _signal_from_direction then enforces against
+#      `min_agree` in code. Same principle as the barrier template's
+#      clamped adjustment: an instruction in prose doesn't bind a model,
+#      a check in code does.
+#   3. Safety margin framed in "typical remaining move" units, not a CDF.
+#      "Spot is 0.4% past the barrier and one sigma of the time left is
+#      0.15%" is a question about whether a reversal has enough room to
+#      happen — something an LLM can reason about in plain terms —
+#      instead of handing it a normal-CDF number to fudge.
+#
+# The economics this depends on: a high winrate only pays if the price
+# paid stays below it (break-even winrate for a contract bought at p IS
+# p — see favorite_bias's config comment for the live case where 82%
+# winrate still lost money). max_coefficient is what enforces that here;
+# it must stay comfortably under the winrate this actually delivers.
+CONFLUENCE_PROMPT_TEMPLATE = (
+    "$symbol. Контракт: спот будет ВЫШЕ или НИЖЕ барьера $target на экспирации, осталось $seconds_left сек.\n"
+    "\n"
+    "Сейчас спот $spot — это ${strike_distance_pct}% от барьера, впереди сторона $side_now.\n"
+    "Типичный ход за оставшееся время (1 сигма): ${sigma_horizon}%.\n"
+    "Дрейф 5 мин: ${drift_5m}% | Импульс 1 мин: ${mom_1m}%\n"
+    "$orderbook_line$funding_line$context_line"
+    "Рынок оценивает UP в $market_px.\n"
+    "\n"
+    "Ты строгий фильтр, а не предсказатель. Ответ по умолчанию — NONE.\n"
+    "Назови направление только если минимум $min_agree из 4 факторов согласны:\n"
+    "  1) запас до барьера больше типичного хода за оставшееся время;\n"
+    "  2) дрейф 5 мин не идёт против этого запаса;\n"
+    "  3) импульс 1 мин не разворачивает движение;\n"
+    "  4) стакан и funding не противоречат.\n"
+    "agree = сколько факторов реально согласны (честно, не подгоняй).\n"
+    "confidence = твоя вероятность оказаться правым (0.5 = монетка).\n"
+    "Ошибиться хуже, чем промолчать.\n"
+    "\n"
+    '{"direction":"UP"|"DOWN"|"NONE","agree":0,"confidence":0.00,"reason":"<=6 слов"}'
 )
 
 # provider -> (api_key env var, default base_url, default model)
@@ -342,6 +419,20 @@ class AIPromptStrategy(BaseStrategy):
             "max_adjustment": f"{max_adjustment:.2f}",
             "drift_5m": f"{drift_5m:.3f}" if drift_5m is not None else "n/a",
             "mom_1m": f"{mom_1m:.3f}" if mom_1m is not None else "n/a",
+            # Safety margin to the barrier, stated plainly rather than as a
+            # CDF input — see CONFLUENCE_PROMPT_TEMPLATE's comment for why
+            # that framing is the point, not a cosmetic rewording. Signed:
+            # positive means spot sits ABOVE the barrier (UP currently
+            # winning), so $side_now names whichever side that is.
+            "strike_distance_pct": (
+                f"{(spot - market.floor_strike) / market.floor_strike * 100:+.3f}"
+                if spot is not None and market.floor_strike else "n/a"
+            ),
+            "side_now": (
+                ("UP" if spot >= market.floor_strike else "DOWN")
+                if spot is not None and market.floor_strike else "n/a"
+            ),
+            "min_agree": str(int(self.config.get("min_agree", 3))),
         }
 
         template_str = str(self.config.get("prompt_template") or DEFAULT_PROMPT_TEMPLATE)
@@ -386,6 +477,25 @@ class AIPromptStrategy(BaseStrategy):
         return self._signal_from_direction(data)
 
     def _signal_from_direction(self, data: dict) -> Optional[Signal]:
+        """Discrete-direction schema: {"direction","confidence",...}, used
+        by DEFAULT_PROMPT_TEMPLATE and CONFLUENCE_PROMPT_TEMPLATE.
+
+        Two OPTIONAL selectivity gates, both enforced here rather than
+        only asked for in the prompt (same reasoning as
+        _signal_from_prob_up's clamped adjustment — prose doesn't bind a
+        model, a check does), both off by default so the plain default
+        template behaves exactly as before:
+
+        * `min_confidence` — drop calls the model itself hedged on. Not a
+          calibrated probability, just a selectivity lever: a model that
+          says 0.55 is telling you it's guessing.
+        * `min_agree` — CONFLUENCE_PROMPT_TEMPLATE asks the model to
+          count how many independent factors actually agree; this is
+          what makes that count mean something. A response with no
+          `agree` field at all passes (any other template's schema
+          shouldn't be silently blocked by a gate meant for this one),
+          but a present-and-too-low count is rejected.
+        """
         direction_raw = str(data.get("direction", "")).strip().upper()
         if direction_raw not in ("UP", "DOWN"):
             return None  # "NONE" or anything unrecognized -> no trade, not an error
@@ -395,6 +505,27 @@ class AIPromptStrategy(BaseStrategy):
         except (TypeError, ValueError):
             confidence = 0.5
         confidence = min(max(confidence, 0.0), 1.0)
+
+        min_confidence = float(self.config.get("min_confidence", 0.0))
+        if confidence < min_confidence:
+            logger.info(
+                "ai_prompt: %s call dropped — confidence %.2f below min_confidence %.2f",
+                direction_raw, confidence, min_confidence,
+            )
+            return None
+
+        min_agree = int(self.config.get("min_agree", 0))
+        if min_agree > 0 and "agree" in data:
+            try:
+                agree = int(data.get("agree"))
+            except (TypeError, ValueError):
+                agree = 0
+            if agree < min_agree:
+                logger.info(
+                    "ai_prompt: %s call dropped — only %d factors agreed, need %d",
+                    direction_raw, agree, min_agree,
+                )
+                return None
 
         reason = str(data.get("reason", "AI analysis"))[:200]
         direction = Direction.UP if direction_raw == "UP" else Direction.DOWN

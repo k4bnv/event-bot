@@ -262,42 +262,71 @@ strategies:
     # by the barrier ({"prob_up": ...}) response schema below, not the
     # default UP/DOWN one.
     min_edge: 0.05
-    # Hard cap on how far the model's own "adjustment" field (see
-    # prompt_template below) is allowed to move base_prob, enforced in
-    # code (_signal_from_prob_up), not just requested in the prompt text —
-    # the prompt's own "не более ±$max_adjustment" line is filled in from
-    # this same value, so the two can't drift out of sync.
+    # Hard cap on how far the model's own "adjustment" field is allowed to
+    # move base_prob, enforced in code (_signal_from_prob_up), not just
+    # requested in the prompt text. Only used by the barrier response
+    # schema — inert with the confluence template below, kept so switching
+    # prompt_template back doesn't need a config edit too.
     max_adjustment: 0.10
+    # --- selectivity gates for the confluence template below ----------------
+    # Both are enforced in code (_signal_from_direction), not just asked for
+    # in the prompt — same reasoning as max_adjustment above. This is what
+    # actually buys winrate: the strategy's job is mostly to say NONE.
+    #
+    # min_agree: how many of the prompt's 4 independent factors must agree
+    # before a direction is accepted. The prompt's own "минимум $min_agree
+    # из 4" line is filled in from this same value, so text and check can't
+    # drift apart. 3/4 = allow one dissenting factor, reject two.
+    min_agree: 3
+    # min_confidence: drop calls the model itself hedged on. Not a
+    # calibrated probability — a model answering 0.55 is telling you it's
+    # guessing, and those are exactly the calls a high-winrate strategy
+    # shouldn't take.
+    min_confidence: 0.7
+    # NOTE on the economics, because "high winrate" alone is a trap: the
+    # break-even winrate for a contract bought at price p IS p (see
+    # favorite_bias's comment above for the live case where an 82% winrate
+    # still lost money). max_coefficient: 0.6 up top is what converts this
+    # prompt's selectivity into actual profit — every trade needs only >60%
+    # to break even. Do NOT raise it above the winrate this actually
+    # delivers once there's real data.
+    #
     # Full prompt template — editable here or live from the dashboard's
     # Settings tab (renders as a textarea). Uses $name / ${name} placeholders
     # (Python string.Template, NOT {name}) — deliberately, since a prompt
     # that asks for JSON back contains literal {...}, which str.format
     # would misparse; a typo'd or removed $placeholder is just left as
-    # literal text instead of crashing this strategy. All placeholders
-    # (incl. $z_score/$base_prob/$sigma_horizon/$drift_5m/$mom_1m/
-    # $max_adjustment used below) are documented in
-    # src/strategies/ai_prompt.py's module docstring. This is the
-    # barrier-estimate template (statistical z-score/CDF as an anchor, LLM
-    # applies a small bounded correction from drift/momentum/orderbook/
-    # funding) — swap for DEFAULT_PROMPT_TEMPLATE's plain wording (also in
-    # ai_prompt.py) if you'd rather have a direct UP/DOWN/NONE call.
+    # literal text instead of crashing this strategy. All placeholders are
+    # documented at the top of src/strategies/ai_prompt.py.
+    #
+    # This is CONFLUENCE_PROMPT_TEMPLATE (see that constant's long comment
+    # in ai_prompt.py for the full design rationale): an abstention-first
+    # filter that must count agreeing factors, NOT a barrier-probability
+    # estimator. Replaced the barrier template 2026-09-10 — that one asked
+    # the model to nudge a number this bot already computes better in code,
+    # and went 0/18 live. BARRIER_PROMPT_TEMPLATE and
+    # DEFAULT_PROMPT_TEMPLATE both still exist in ai_prompt.py if you want
+    # to switch back.
     prompt_template: |-
-      $symbol, барьер $target, спот $spot, market_px_up=$market_px, осталось $seconds_left сек.
+      $symbol. Контракт: спот будет ВЫШЕ или НИЖЕ барьера $target на экспирации, осталось $seconds_left сек.
 
-      Предрасчитано в коде:
-        z-score: $z_score
-        нормальная CDF(z): $base_prob
-        sigma на оставшийся горизонт: ${sigma_horizon}%
+      Сейчас спот $spot — это ${strike_distance_pct}% от барьера, впереди сторона $side_now.
+      Типичный ход за оставшееся время (1 сигма): ${sigma_horizon}%.
       Дрейф 5 мин: ${drift_5m}% | Импульс 1 мин: ${mom_1m}%
       $orderbook_line$funding_line$context_line
-      BASE_PROB — чисто статистическая оценка без учёта направления рынка.
-      Скорректируй её на дрейф, импульс, стакан и funding. Коррекция не более ±${max_adjustment}.
-      Если сигналы разнонаправлены — коррекция близка к нулю.
-      Торгуем расхождением между твоей итоговой prob_up и market_px_up, а не отклонением от 0.5 —
-      рынок мог уже частично отразить движение.
+      Рынок оценивает UP в $market_px.
 
-      {"base_prob":0.00,"adjustment":0.00,"prob_up":0.00,
-      "reason":"<=6 слов"}
+      Ты строгий фильтр, а не предсказатель. Ответ по умолчанию — NONE.
+      Назови направление только если минимум $min_agree из 4 факторов согласны:
+        1) запас до барьера больше типичного хода за оставшееся время;
+        2) дрейф 5 мин не идёт против этого запаса;
+        3) импульс 1 мин не разворачивает движение;
+        4) стакан и funding не противоречат.
+      agree = сколько факторов реально согласны (честно, не подгоняй).
+      confidence = твоя вероятность оказаться правым (0.5 = монетка).
+      Ошибиться хуже, чем промолчать.
+
+      {"direction":"UP"|"DOWN"|"NONE","agree":0,"confidence":0.00,"reason":"<=6 слов"}
 
   # Deliberate OPPOSITE of fair_value_edge: trusts the market's own price
   # outright and just follows whichever side it already favors, instead of
