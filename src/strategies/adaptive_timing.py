@@ -1,5 +1,5 @@
 """
-Strategy J — Adaptive Timing (free-scanning Orderbook Imbalance).
+Strategy J — Adaptive Timing (free-scanning Favorite Bias).
 
 Every other strategy is told WHEN to look — the engine calls its
 evaluate() only at a handful of configured entry_windows_min checkpoints
@@ -13,25 +13,28 @@ This strategy instead gets called at a DENSE grid of checkpoints
 (entry_windows_min: [10, 9, ..., 1] in config.yaml) and answers the
 opposite question: not "is now a good moment for a fixed 2-minute bet",
 but "of all the moments I've been asked about in this market's life so
-far, is *this* the first one where the book actually looks skewed enough
-to bet" — i.e. it picks its own moment by scanning, rather than having
-one assigned.
+far, is *this* the first one where one side has already become the
+crowd's clear favorite" — i.e. it picks its own moment by scanning,
+rather than having one assigned.
 
-Underlying signal changed 2026-09-10 (kept the class/strategy name/
-wallet — same continuity as this session's other config-only tweaks):
-was a copy of Strategy E's (FairValueEdgeStrategy) driftless log-normal
-edge calculation, deliberately identical so the two were an apples-to-
-apples "fixed checkpoints vs scan for the edge" comparison. User asked
-to swap it for a different underlying signal while keeping the scanning
-shell — picked Strategy B's (OrderbookMomentumStrategy) resting bid/ask
-imbalance instead (see that module's docstring), for the same reason E
-was picked originally: B already exists as B's own fixed-checkpoint
-version of this exact signal, so this strategy is now B's "scan for the
-moment instead of guessing it" pairing — same apples-to-apples logic,
-just against a different base strategy. Over many trades, the
-Combo/Leaderboard table (which groups by the trade's *actual*
-entry_window_min) becomes a live, empirical answer to "which
-minute-to-expiry is actually best for an orderbook-imbalance edge".
+Underlying signal history (kept the class/strategy name/wallet through
+all of it — same continuity as this session's other config-only
+tweaks): started as a copy of Strategy E's (fair_value_edge) driftless
+log-normal edge math; swapped 2026-09-10 to Strategy B's
+(orderbook_momentum) bid/ask imbalance; both lost money over real live
+stretches. Swapped again the same day to Strategy H's
+(FavoriteBiasStrategy) crowd-momentum signal — picked over a plain
+funding_rate_threshold copy of Strategy F specifically because funding
+rate barely changes within one market's few-minute lifespan (it settles
+every ~8h), so scanning it would mostly just fire-or-not at the first
+checkpoint checked and sit there identically after — no real "moment"
+to find. market.up_price, by contrast, is the single fastest-moving
+input in the whole system, so continuous scanning here asks a genuinely
+different, useful question from H's own fixed-checkpoint version: does
+riding the favorite AS SOON AS it clears favorite_price_threshold (often
+still well before expiry, arguably a less-decided market) do better or
+worse than H's deliberately late (3м/1м) checkpoints, where the outcome
+tends to already look close to settled?
 
 Because it's called at many checkpoints per market but must place AT
 MOST ONE trade per market, it relies on
@@ -60,31 +63,32 @@ class AdaptiveTimingStrategy(BaseStrategy):
         if ctx.already_open_this_market:
             return None  # already committed to this market at an earlier checkpoint
 
-        orderbook = ctx.orderbook
-        if orderbook is None or not orderbook.bids or not orderbook.asks:
+        market = ctx.market
+        if market.up_price is None:
             return None
 
-        depth = int(self.config.get("orderbook_depth_levels", 10))
-        threshold = float(self.config.get("imbalance_threshold", 1.8))
+        threshold = float(self.config.get("favorite_price_threshold", 0.70))
+        up_price = market.up_price
+        down_price = 1.0 - up_price
+        reason_prefix = f"скан на {ctx.window_min}м: "
 
-        bid_vol = orderbook.bid_volume(depth)
-        ask_vol = orderbook.ask_volume(depth)
-        if bid_vol <= 0 or ask_vol <= 0:
-            return None
-
-        ratio = bid_vol / ask_vol
-        if ratio >= threshold:
-            direction, strength = Direction.UP, ratio
-        elif ratio <= 1 / threshold:
-            direction, strength = Direction.DOWN, 1 / ratio
-        else:
-            return None
-
-        return Signal(
-            direction=direction,
-            reason=(
-                f"скан на {ctx.window_min}м: orderbook imbalance {ratio:.2f}x "
-                f"(bid={bid_vol:.2f} ask={ask_vol:.2f}, top {depth})"
-            ),
-            confidence=min(0.9, 0.4 + (strength - threshold) / (threshold * 2)),
-        )
+        # up_price/down_price sum to 1, so with the default threshold
+        # (> 0.5) at most one side can ever qualify — the >= comparisons
+        # below still resolve the tie cleanly if a lower threshold is
+        # configured such that both sides technically qualify.
+        if up_price >= threshold and up_price >= down_price:
+            return Signal(
+                direction=Direction.UP,
+                reason=f"{reason_prefix}favorite bias: UP priced {up_price:.2f} >= {threshold:.2f}, riding the crowd",
+                confidence=min(0.9, 0.4 + (up_price - threshold) / (1.0 - threshold + 1e-9) * 0.5),
+            )
+        if down_price >= threshold and down_price > up_price:
+            return Signal(
+                direction=Direction.DOWN,
+                reason=(
+                    f"{reason_prefix}favorite bias: DOWN priced {down_price:.2f} >= {threshold:.2f}, "
+                    f"riding the crowd"
+                ),
+                confidence=min(0.9, 0.4 + (down_price - threshold) / (1.0 - threshold + 1e-9) * 0.5),
+            )
+        return None

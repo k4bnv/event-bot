@@ -49,7 +49,7 @@ def make_config_with_adaptive_timing(data_dir: Path) -> AppConfig:
     cfg.strategies.append(
         StrategyConfig(
             name="adaptive_timing", display_name="J", enabled=True, deposit_usd=100.0,
-            entry_windows_min=[5, 4, 3], max_coefficient=0.7, stake_fraction=0.08,
+            entry_windows_min=[5, 4, 3], max_coefficient=0.9, stake_fraction=0.08,
             dynamic_timing=True, extra={},
         )
     )
@@ -590,10 +590,15 @@ class AdaptiveTimingOneShotPerMarketTests(unittest.IsolatedAsyncioTestCase):
             engine = self._make_engine(Path(tmp))
             series_id = engine.cfg.okx.series_ids[0]
 
+            # up_price=0.85 is well above the default favorite_price_threshold
+            # of 0.70 — adaptive_timing's signal is now favorite bias (see
+            # its module docstring), a clear, persistent favorite so BOTH
+            # due checkpoints below would signal if nothing stopped the
+            # second one.
             expiry_ts = time.time() + 60
             market = EventMarket(
                 series_id=series_id, method="price_up_down", inst_id="TEST-INST-ADAPTIVE",
-                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.50, state="live",
+                expiry_ts=expiry_ts, floor_strike=50000.0, up_price=0.85, state="live",
             )
             engine.provider._active_markets[series_id] = market
             now = time.time()
@@ -601,15 +606,6 @@ class AdaptiveTimingOneShotPerMarketTests(unittest.IsolatedAsyncioTestCase):
             for i in range(20):
                 px = 50000.0 + (5 if i % 2 == 0 else -5)
                 engine.provider._price_history.append(PricePoint(ts=now - (20 - i), price=px))
-            # Heavily bid-skewed book (10x the default imbalance_threshold
-            # of 1.8) — adaptive_timing's signal is now orderbook
-            # imbalance (see its module docstring), a clear, persistent
-            # skew so BOTH due checkpoints below would signal if nothing
-            # stopped the second one.
-            engine.provider._orderbook = OrderBookSnapshot(
-                ts=now, bids=[OrderBookLevel(price=49995.0, size=10.0)],
-                asks=[OrderBookLevel(price=50005.0, size=1.0)],
-            )
 
             # Prime the window at remaining=5min so BOTH "4" and "3" (out
             # of adaptive_timing's configured [5, 4, 3]) end up due

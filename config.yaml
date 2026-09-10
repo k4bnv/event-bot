@@ -342,25 +342,27 @@ strategies:
     max_coefficient: 0.85
     stake_fraction: 0.01
 
-  # Same signal as orderbook_momentum (B) — resting bid/ask volume
-  # imbalance in the top N book levels — but instead of a few fixed
-  # checkpoints, it's scanned at a dense grid and enters at the FIRST
-  # moment (per market) the imbalance clears imbalance_threshold,
-  # wherever in the market's life that happens to be. dynamic_timing:
-  # true is required here — it collapses all these checkpoints onto ONE
-  # shared wallet instead of splitting capital across a dozen of them
-  # (see src/strategies/adaptive_timing.py's module docstring). Over
-  # many trades, the "Стратегия × время входа" table's entry_window_min
-  # column becomes a live, empirical answer to "which minute-to-expiry
-  # is actually best for an orderbook-imbalance edge" — compare its
-  # actual chosen windows against B's fixed 12/7/2 to see whether
-  # picking the moment beats guessing it.
+  # Same signal as favorite_bias (H) — ride whichever side the crowd
+  # already favors once it clears favorite_price_threshold — but instead
+  # of H's deliberately LATE fixed checkpoints (3м/1м, close to expiry
+  # where the outcome tends to already look decided), it's scanned at a
+  # dense grid and enters at the FIRST moment (per market) a side clears
+  # the threshold, wherever in the market's life that happens to be —
+  # often much earlier, while the outcome is still genuinely uncertain.
+  # dynamic_timing: true is required here — it collapses all these
+  # checkpoints onto ONE shared wallet instead of splitting capital
+  # across a dozen of them (see src/strategies/adaptive_timing.py's
+  # module docstring). Over many trades, the "Стратегия × время входа"
+  # table's entry_window_min column becomes a live, empirical answer to
+  # "does riding the favorite as soon as it emerges beat waiting for a
+  # late, near-certain checkpoint" — compare its actual chosen windows
+  # against H's fixed 3/1.
   #
-  # Was fair_value_edge's (E's) driftless log-normal edge math
-  # (lookback_sec/min_edge) until 2026-09-10 — swapped to a different
-  # underlying signal at the user's request while keeping the scanning
-  # shell; see the module docstring's "Underlying signal changed" note.
-  # max_coefficient matches B's own (0.65, not the old 0.7) so the B-vs-J
+  # Signal history (module docstring has the full story): started as
+  # fair_value_edge's (E's) edge math, swapped 2026-09-10 to
+  # orderbook_momentum's (B's) imbalance, swapped again the same day to
+  # this — both earlier versions lost money live. max_coefficient/
+  # favorite_price_threshold match H's own current values so the H-vs-J
   # comparison this strategy exists for stays apples-to-apples.
   adaptive_timing:
     enabled: true
@@ -368,10 +370,9 @@ strategies:
     deposit_usd: 100
     dynamic_timing: true
     entry_windows_min: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1]
-    max_coefficient: 0.65
+    max_coefficient: 0.85
     stake_fraction: 0.01
-    orderbook_depth_levels: 10
-    imbalance_threshold: 1.8
+    favorite_price_threshold: 0.70
 
   # "Failed attack -> reversal": heavy real aggressor selling (from the
   # underlying's actual executed trade tape, not resting book orders —
